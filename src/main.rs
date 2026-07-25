@@ -1,3 +1,3 @@
 fn main() {
-    println!("Hello, world!");
+    println!("hkb 0.1.0 — Humble Knowledge Builder");
 }
