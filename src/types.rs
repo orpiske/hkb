@@ -79,15 +79,13 @@ impl Default for DiscoveryConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkConfig {
-    pub target_tokens: usize,
-    pub overlap_tokens: usize,
+    pub max_characters: usize,
 }
 
 impl Default for ChunkConfig {
     fn default() -> Self {
         Self {
-            target_tokens: 1_000,
-            overlap_tokens: 100,
+            max_characters: 4_000,
         }
     }
 }
@@ -220,6 +218,7 @@ mod tests {
         assert_eq!(config.repository, std::path::PathBuf::from("."));
         assert_eq!(config.include, InputScope::Docs);
         assert!(config.discovery.respect_gitignore);
+        assert_eq!(config.chunking.max_characters, 4_000);
         assert_eq!(config.generation.questions_per_chunk, 3);
         assert_eq!(
             config.export.output,
