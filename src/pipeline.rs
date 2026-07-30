@@ -45,8 +45,14 @@ pub enum BuildError {
     Discovery(#[from] DiscoveryError),
     #[error(transparent)]
     Chunk(#[from] ChunkError),
-    #[error(transparent)]
-    Llm(#[from] LlmError),
+    #[error("LLM generation failed for {path}:{start_line}-{end_line}: {source}")]
+    Llm {
+        path: String,
+        start_line: usize,
+        end_line: usize,
+        #[source]
+        source: LlmError,
+    },
     #[error(transparent)]
     Cache(#[from] CacheError),
     #[error(transparent)]
@@ -138,14 +144,18 @@ pub async fn build_dataset_with_progress(
                 }
                 None => {
                     progress.report(ProgressEvent::LlmRequestStarted);
-                    let batch = generate_batch(client, chunk, config).await?;
+                    let batch = generate_batch(client, chunk, config)
+                        .await
+                        .map_err(|source| llm_build_error(chunk, source))?;
                     cache.store(chunk, &config.generation, &batch)?;
                     batch
                 }
             }
         } else {
             progress.report(ProgressEvent::LlmRequestStarted);
-            generate_batch(client, chunk, config).await?
+            generate_batch(client, chunk, config)
+                .await
+                .map_err(|source| llm_build_error(chunk, source))?
         };
 
         progress.report(ProgressEvent::ChunkFinished {
@@ -271,6 +281,15 @@ fn to_qa_items(
             }
         })
         .collect()
+}
+
+fn llm_build_error(chunk: &Chunk, source: LlmError) -> BuildError {
+    BuildError::Llm {
+        path: chunk.path.clone(),
+        start_line: chunk.start_line,
+        end_line: chunk.end_line,
+        source,
+    }
 }
 
 fn create_parent_directory(path: &Path) -> Result<(), BuildError> {

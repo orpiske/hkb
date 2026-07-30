@@ -23,8 +23,14 @@ pub enum LlmError {
     Http(#[from] reqwest::Error),
     #[error("LLM API returned HTTP {status}: {body}")]
     Api { status: StatusCode, body: String },
-    #[error("LLM returned invalid JSON")]
-    InvalidJson(#[source] serde_json::Error),
+    #[error("LLM returned malformed JSON: {source}; response excerpt: {excerpt}")]
+    InvalidJson {
+        #[source]
+        source: serde_json::Error,
+        excerpt: String,
+    },
+    #[error("LLM returned JSON with an unexpected schema: {reason}; response excerpt: {excerpt}")]
+    UnexpectedSchema { reason: String, excerpt: String },
     #[error("LLM response did not contain a completion")]
     MissingCompletion,
 }
@@ -58,7 +64,7 @@ struct OllamaRequest<'a> {
     model: &'a str,
     prompt: &'a str,
     stream: bool,
-    format: &'a str,
+    format: &'a serde_json::Value,
     options: OllamaOptions,
 }
 
@@ -79,6 +85,7 @@ impl LlmClient for OllamaClient {
         prompt: &str,
         config: &GenerationConfig,
     ) -> Result<Vec<GeneratedQa>, LlmError> {
+        let response_schema = generated_response_schema(config.questions_per_chunk);
         let response = self
             .http
             .post(format!("{}/api/generate", self.endpoint))
@@ -86,7 +93,7 @@ impl LlmClient for OllamaClient {
                 model: &config.model,
                 prompt,
                 stream: false,
-                format: "json",
+                format: &response_schema,
                 options: OllamaOptions {
                     temperature: config.temperature,
                 },
@@ -95,7 +102,10 @@ impl LlmClient for OllamaClient {
             .await?;
         let body = checked_body(response).await?;
         let response: OllamaResponse =
-            serde_json::from_str(&body).map_err(LlmError::InvalidJson)?;
+            serde_json::from_str(&body).map_err(|source| LlmError::InvalidJson {
+                source,
+                excerpt: response_excerpt(&body),
+            })?;
 
         parse_generated_questions(&response.response)
     }
@@ -171,7 +181,10 @@ impl LlmClient for OpenAiCompatibleClient {
         let response = request.send().await?;
         let body = checked_body(response).await?;
         let response: OpenAiResponse =
-            serde_json::from_str(&body).map_err(LlmError::InvalidJson)?;
+            serde_json::from_str(&body).map_err(|source| LlmError::InvalidJson {
+                source,
+                excerpt: response_excerpt(&body),
+            })?;
         let completion = response
             .choices
             .into_iter()
@@ -191,35 +204,97 @@ async fn checked_body(response: reqwest::Response) -> Result<String, LlmError> {
     Ok(body)
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum GeneratedEnvelope {
-    Wrapped { items: Vec<GeneratedQa> },
-    Bare(Vec<GeneratedQa>),
-}
-
 fn parse_generated_questions(raw: &str) -> Result<Vec<GeneratedQa>, LlmError> {
-    let json = strip_code_fence(raw);
-    let envelope: GeneratedEnvelope = serde_json::from_str(json).map_err(LlmError::InvalidJson)?;
+    let json = json_candidate(raw);
+    let value: serde_json::Value =
+        serde_json::from_str(json).map_err(|source| LlmError::InvalidJson {
+            source,
+            excerpt: response_excerpt(raw),
+        })?;
+    let items = match value {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(mut object) => object
+            .remove("items")
+            .or_else(|| object.remove("questions"))
+            .and_then(|items| items.as_array().cloned())
+            .ok_or_else(|| LlmError::UnexpectedSchema {
+                reason: "expected an array or an object containing an `items` array".to_owned(),
+                excerpt: response_excerpt(raw),
+            })?,
+        _ => {
+            return Err(LlmError::UnexpectedSchema {
+                reason: "expected a JSON array or object".to_owned(),
+                excerpt: response_excerpt(raw),
+            });
+        }
+    };
 
-    Ok(match envelope {
-        GeneratedEnvelope::Wrapped { items } | GeneratedEnvelope::Bare(items) => items,
+    serde_json::from_value(serde_json::Value::Array(items)).map_err(|source| {
+        LlmError::UnexpectedSchema {
+            reason: source.to_string(),
+            excerpt: response_excerpt(raw),
+        }
     })
 }
 
-fn strip_code_fence(raw: &str) -> &str {
+fn json_candidate(raw: &str) -> &str {
     let trimmed = raw.trim();
-    let Some(after_opening) = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-    else {
-        return trimmed;
-    };
+    if let Some(opening) = trimmed.find("```") {
+        let after_fence = &trimmed[opening + 3..];
+        let after_language = after_fence
+            .strip_prefix("json")
+            .unwrap_or(after_fence)
+            .trim_start();
+        return after_language
+            .split_once("```")
+            .map_or(after_language, |(json, _)| json)
+            .trim();
+    }
 
-    after_opening
-        .strip_suffix("```")
-        .unwrap_or(after_opening)
-        .trim()
+    trimmed
+}
+
+fn generated_response_schema(questions_per_chunk: usize) -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "minItems": questions_per_chunk,
+                "maxItems": questions_per_chunk,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "question": { "type": "string" },
+                        "answer": { "type": "string" },
+                        "tags": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "confidence": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": 1
+                        }
+                    },
+                    "required": ["question", "answer"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["items"],
+        "additionalProperties": false
+    })
+}
+
+fn response_excerpt(response: &str) -> String {
+    const MAX_CHARACTERS: usize = 500;
+
+    let mut excerpt = response.chars().take(MAX_CHARACTERS).collect::<String>();
+    if response.chars().count() > MAX_CHARACTERS {
+        excerpt.push_str("...");
+    }
+    excerpt
 }
 
 #[cfg(test)]
@@ -255,6 +330,30 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn accepts_questions_alias_and_surrounding_prose() -> Result<(), Box<dyn std::error::Error>> {
+        let items = parse_generated_questions(
+            "Here is the result:\n```json\n{\"questions\":[{\"question\":\"Q\",\"answer\":\"A\"}]}\n```",
+        )?;
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].answer, "A");
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_json_reports_reason_and_excerpt() {
+        let error = parse_generated_questions(r#"{"items":[{"question":"Q"}"#)
+            .err()
+            .map(|error| error.to_string());
+
+        assert!(error.as_deref().is_some_and(|message| {
+            message.contains("malformed JSON")
+                && message.contains("line 1 column")
+                && message.contains("response excerpt")
+        }));
+    }
+
     #[tokio::test]
     async fn ollama_client_uses_generate_endpoint() -> Result<(), Box<dyn std::error::Error>> {
         let generated = r#"{"items":[{"question":"Q","answer":"A"}]}"#;
@@ -272,6 +371,8 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert!(request.starts_with("POST /api/generate "));
         assert!(request.contains("\"stream\":false"));
+        assert!(request.contains("\"minItems\":3"));
+        assert!(request.contains("\"required\":[\"items\"]"));
         Ok(())
     }
 
