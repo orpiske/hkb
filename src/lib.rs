@@ -1,2 +1,11 @@
+pub mod cache;
 pub mod chunker;
+pub mod discover;
+pub mod export;
+mod identity;
+pub mod llm;
+pub mod pipeline;
+pub mod progress;
+pub mod prompt;
+pub mod qa;
 pub mod types;

@@ -4,10 +4,12 @@ use std::{
 };
 
 use pulldown_cmark::{Event, Parser, Tag};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::types::{Chunk, ChunkConfig};
+use crate::{
+    identity::sha256_hex,
+    types::{Chunk, ChunkConfig},
+};
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ChunkError {
@@ -114,11 +116,11 @@ fn build_chunk(path: &str, text: &str, range: Range<usize>) -> Chunk {
     let chunk_text = &text[range.clone()];
     let start_line = line_number_at(text, range.start);
     let end_line = start_line + chunk_text.bytes().filter(|byte| *byte == b'\n').count();
-    let content_hash = sha256(chunk_text.as_bytes());
+    let content_hash = sha256_hex(chunk_text.as_bytes());
     let identity = format!("{path}\0{start_line}\0{end_line}\0{content_hash}");
 
     Chunk {
-        chunk_id: sha256(identity.as_bytes()),
+        chunk_id: sha256_hex(identity.as_bytes()),
         path: path.to_owned(),
         language: "markdown".to_owned(),
         start_line,
@@ -134,10 +136,6 @@ fn line_number_at(text: &str, byte_offset: usize) -> usize {
         .filter(|byte| *byte == b'\n')
         .count()
         + 1
-}
-
-fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[cfg(test)]
