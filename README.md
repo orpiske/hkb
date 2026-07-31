@@ -29,6 +29,26 @@ During a build, HKB reports every Markdown file it chunks and shows a live per-c
 The active status distinguishes LLM requests from cache hits and includes the source file and line
 range currently being processed.
 
+### Additional Ignore Rules
+
+Use `--ignore-file` to apply repository-relative gitignore-style exclusions without modifying the
+target repository:
+
+```text
+path/to/module/
+path/to/another/**test.md
+```
+
+```bash
+cargo run -- build \
+  --repo /path/to/repository \
+  --ignore-file ~/.config/hkb/java.ignore
+```
+
+The option may be repeated. Custom rules apply even with `--no-gitignore` and take final exclusion
+precedence over repository rules. Relative ignore-file paths are resolved from the directory where
+HKB is launched; patterns inside each file are rooted at `--repo`.
+
 ## OpenAI-Compatible APIs
 
 Set an API key when the server requires one:

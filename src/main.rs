@@ -64,6 +64,10 @@ struct BuildArgs {
     #[arg(long)]
     api_key_file: Option<PathBuf>,
 
+    /// Apply additional gitignore-style rules from a file. May be repeated.
+    #[arg(long = "ignore-file", value_name = "PATH")]
+    ignore_files: Vec<PathBuf>,
+
     /// Maximum number of Markdown files to process.
     #[arg(long)]
     max_files: Option<usize>,
@@ -177,6 +181,7 @@ async fn run(cli: Cli) -> Result<BuildOutcome, CliError> {
                 include: InputScope::Docs,
                 discovery: DiscoveryConfig {
                     respect_gitignore: !args.no_gitignore,
+                    ignore_files: args.ignore_files,
                     max_files: args.max_files,
                     max_bytes_per_file: args.max_bytes_per_file,
                 },
@@ -381,6 +386,7 @@ mod tests {
         assert_eq!(args.max_characters, 4_000);
         assert_eq!(args.api_key_env, "OPENAI_API_KEY");
         assert!(args.api_key_file.is_none());
+        assert!(args.ignore_files.is_empty());
         assert!(!args.no_cache);
         Ok(())
     }
@@ -399,6 +405,28 @@ mod tests {
 
         assert!(matches!(args.provider, ProviderArg::OpenaiCompatible));
         assert_eq!(args.model.as_deref(), Some("local-model"));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_multiple_custom_ignore_files() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from([
+            "hkb",
+            "build",
+            "--ignore-file",
+            "first.ignore",
+            "--ignore-file",
+            "second.ignore",
+        ])?;
+        let Command::Build(args) = cli.command;
+
+        assert_eq!(
+            args.ignore_files,
+            [
+                std::path::PathBuf::from("first.ignore"),
+                std::path::PathBuf::from("second.ignore")
+            ]
+        );
         Ok(())
     }
 

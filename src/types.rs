@@ -63,6 +63,7 @@ pub enum ExportFormat {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveryConfig {
     pub respect_gitignore: bool,
+    pub ignore_files: Vec<PathBuf>,
     pub max_files: Option<usize>,
     pub max_bytes_per_file: u64,
 }
@@ -71,6 +72,7 @@ impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
             respect_gitignore: true,
+            ignore_files: Vec::new(),
             max_files: None,
             max_bytes_per_file: 1_000_000,
         }
@@ -218,6 +220,7 @@ mod tests {
         assert_eq!(config.repository, std::path::PathBuf::from("."));
         assert_eq!(config.include, InputScope::Docs);
         assert!(config.discovery.respect_gitignore);
+        assert!(config.discovery.ignore_files.is_empty());
         assert_eq!(config.chunking.max_characters, 4_000);
         assert_eq!(config.generation.questions_per_chunk, 3);
         assert_eq!(

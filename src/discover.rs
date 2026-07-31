@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, gitignore::GitignoreBuilder};
 use thiserror::Error;
 
 use crate::types::DiscoveryConfig;
@@ -40,6 +40,20 @@ pub enum DiscoveryError {
     NotDirectory(PathBuf),
     #[error("failed while walking the repository")]
     Walk(#[from] ignore::Error),
+    #[error("failed to load custom ignore rules from {path}")]
+    IgnoreFile {
+        path: PathBuf,
+        #[source]
+        source: ignore::Error,
+    },
+    #[error("failed to read custom ignore rules from {path}")]
+    IgnoreFileRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to build custom ignore rules")]
+    IgnoreRules(#[source] ignore::Error),
     #[error("failed to read metadata for {path}")]
     Metadata {
         path: PathBuf,
@@ -62,6 +76,7 @@ pub fn discover_markdown(
         return Err(DiscoveryError::NotDirectory(repository.to_path_buf()));
     }
 
+    let custom_ignores = build_custom_ignores(repository, &config.ignore_files)?;
     let mut builder = WalkBuilder::new(repository);
     builder
         .hidden(false)
@@ -71,7 +86,18 @@ pub fn discover_markdown(
         .git_global(false)
         .git_ignore(config.respect_gitignore)
         .git_exclude(config.respect_gitignore)
-        .filter_entry(|entry| !matches!(entry.file_name().to_str(), Some(".git" | ".hkb")));
+        .filter_entry(move |entry| {
+            if matches!(entry.file_name().to_str(), Some(".git" | ".hkb")) {
+                return false;
+            }
+
+            let is_directory = entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_dir());
+            !custom_ignores
+                .matched_path_or_any_parents(entry.path(), is_directory)
+                .is_ignore()
+        });
 
     let mut candidates = Vec::new();
     for entry in builder.build() {
@@ -141,6 +167,46 @@ pub fn discover_markdown(
     Ok(report)
 }
 
+fn build_custom_ignores(
+    repository: &Path,
+    ignore_files: &[PathBuf],
+) -> Result<ignore::gitignore::Gitignore, DiscoveryError> {
+    let mut builder = GitignoreBuilder::new(repository);
+    for path in ignore_files {
+        let contents =
+            fs::read_to_string(path).map_err(|source| DiscoveryError::IgnoreFileRead {
+                path: path.clone(),
+                source,
+            })?;
+        if let Some(source) = builder.add(path) {
+            return Err(DiscoveryError::IgnoreFile {
+                path: path.clone(),
+                source,
+            });
+        }
+        for expanded in contents.lines().filter_map(expand_recursive_suffix_pattern) {
+            builder
+                .add_line(Some(path.clone()), &expanded)
+                .map_err(|source| DiscoveryError::IgnoreFile {
+                    path: path.clone(),
+                    source,
+                })?;
+        }
+    }
+
+    builder.build().map_err(DiscoveryError::IgnoreRules)
+}
+
+fn expand_recursive_suffix_pattern(pattern: &str) -> Option<String> {
+    let marker = pattern.find("/**")?;
+    let suffix = &pattern[marker + 3..];
+    if suffix.is_empty() || suffix.starts_with('/') {
+        return None;
+    }
+
+    Some(format!("{}/**/*{suffix}", &pattern[..marker]))
+}
+
 fn is_markdown(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
@@ -153,7 +219,7 @@ fn normalize_line_endings(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{fs, path::PathBuf};
 
     use super::{SkipReason, discover_markdown};
     use crate::types::DiscoveryConfig;
@@ -224,6 +290,49 @@ mod tests {
             SkipReason::TooLarge { .. }
         ));
         assert_eq!(report.skipped[1].reason, SkipReason::FileLimit);
+        Ok(())
+    }
+
+    #[test]
+    fn applies_repository_relative_custom_ignore_rules() -> Result<(), Box<dyn std::error::Error>> {
+        let repository = tempfile::tempdir()?;
+        fs::create_dir_all(repository.path().join("path/to/module"))?;
+        fs::create_dir_all(repository.path().join("path/to/another/nested"))?;
+        fs::write(
+            repository.path().join("custom.ignore"),
+            "path/to/module/\npath/to/another/**test.md\n",
+        )?;
+        fs::write(
+            repository.path().join("path/to/module/README.md"),
+            "# Ignored module",
+        )?;
+        fs::write(
+            repository
+                .path()
+                .join("path/to/another/nested/smoke-test.md"),
+            "# Ignored test",
+        )?;
+        fs::write(
+            repository.path().join("path/to/another/guide.md"),
+            "# Included guide",
+        )?;
+        let config = DiscoveryConfig {
+            respect_gitignore: false,
+            ignore_files: vec![repository.path().join("custom.ignore")],
+            ..DiscoveryConfig::default()
+        };
+
+        let report = discover_markdown(repository.path(), &config)?;
+
+        assert_eq!(
+            report.discovered_files, 1,
+            "unexpected documents: {:?}",
+            report.documents
+        );
+        assert_eq!(
+            report.documents[0].path,
+            PathBuf::from("path/to/another/guide.md")
+        );
         Ok(())
     }
 }
