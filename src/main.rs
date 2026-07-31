@@ -1,4 +1,9 @@
-use std::{env, path::PathBuf, process::ExitCode, time::Duration};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::ExitCode,
+    time::Duration,
+};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use hkb::{
@@ -50,6 +55,14 @@ struct BuildArgs {
     /// Override the provider API endpoint.
     #[arg(long)]
     endpoint: Option<String>,
+
+    /// Environment variable containing the API key.
+    #[arg(long, default_value = "OPENAI_API_KEY")]
+    api_key_env: String,
+
+    /// Read the API key from a file instead of the environment.
+    #[arg(long)]
+    api_key_file: Option<PathBuf>,
 
     /// Maximum number of Markdown files to process.
     #[arg(long)]
@@ -104,6 +117,20 @@ impl From<ProviderArg> for LlmProvider {
 enum CliError {
     #[error("--model is required for the OpenAI-compatible provider")]
     ModelRequired,
+    #[error("failed to read API key file {path}")]
+    ApiKeyFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("API key file is empty: {0}")]
+    EmptyApiKeyFile(PathBuf),
+    #[error("API key environment variable {name} is not valid Unicode")]
+    InvalidApiKeyEnvironment {
+        name: String,
+        #[source]
+        source: env::VarError,
+    },
     #[error(transparent)]
     Build(#[from] BuildError),
 }
@@ -136,11 +163,11 @@ async fn run(cli: Cli) -> Result<BuildOutcome, CliError> {
                     (model, endpoint, client)
                 }
                 LlmProvider::OpenAiCompatible => {
+                    let api_key = resolve_api_key(args.api_key_file.as_deref(), &args.api_key_env)?;
                     let model = args.model.ok_or(CliError::ModelRequired)?;
                     let endpoint = args
                         .endpoint
                         .unwrap_or_else(|| DEFAULT_OPENAI_ENDPOINT.to_owned());
-                    let api_key = env::var("OPENAI_API_KEY").ok();
                     let client = Box::new(OpenAiCompatibleClient::new(&endpoint, api_key));
                     (model, endpoint, client)
                 }
@@ -176,6 +203,32 @@ async fn run(cli: Cli) -> Result<BuildOutcome, CliError> {
 
             Ok(build_dataset_with_progress(client.as_ref(), &config, &progress).await?)
         }
+    }
+}
+
+fn resolve_api_key(
+    api_key_file: Option<&Path>,
+    api_key_environment: &str,
+) -> Result<Option<String>, CliError> {
+    if let Some(path) = api_key_file {
+        let value = fs::read_to_string(path).map_err(|source| CliError::ApiKeyFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let key = value.trim();
+        if key.is_empty() {
+            return Err(CliError::EmptyApiKeyFile(path.to_path_buf()));
+        }
+        return Ok(Some(key.to_owned()));
+    }
+
+    match env::var(api_key_environment) {
+        Ok(value) if !value.trim().is_empty() => Ok(Some(value.trim().to_owned())),
+        Ok(_) | Err(env::VarError::NotPresent) => Ok(None),
+        Err(source) => Err(CliError::InvalidApiKeyEnvironment {
+            name: api_key_environment.to_owned(),
+            source,
+        }),
     }
 }
 
@@ -316,7 +369,7 @@ fn generation_style() -> ProgressStyle {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, ProviderArg};
+    use super::{Cli, Command, ProviderArg, resolve_api_key};
 
     #[test]
     fn parses_build_defaults() -> Result<(), clap::Error> {
@@ -326,6 +379,8 @@ mod tests {
         assert!(matches!(args.provider, ProviderArg::Ollama));
         assert_eq!(args.repo, std::path::PathBuf::from("."));
         assert_eq!(args.max_characters, 4_000);
+        assert_eq!(args.api_key_env, "OPENAI_API_KEY");
+        assert!(args.api_key_file.is_none());
         assert!(!args.no_cache);
         Ok(())
     }
@@ -344,6 +399,30 @@ mod tests {
 
         assert!(matches!(args.provider, ProviderArg::OpenaiCompatible));
         assert_eq!(args.model.as_deref(), Some("local-model"));
+        Ok(())
+    }
+
+    #[test]
+    fn reads_and_trims_api_key_file() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("api-key");
+        std::fs::write(&path, " secret-value \n")?;
+
+        let key = resolve_api_key(Some(&path), "UNUSED_ENVIRONMENT")?;
+
+        assert_eq!(key.as_deref(), Some("secret-value"));
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_empty_api_key_file() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("api-key");
+        std::fs::write(&path, " \n")?;
+
+        let result = resolve_api_key(Some(&path), "UNUSED_ENVIRONMENT");
+
+        assert!(matches!(result, Err(super::CliError::EmptyApiKeyFile(_))));
         Ok(())
     }
 }

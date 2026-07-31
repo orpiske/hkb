@@ -37,6 +37,24 @@ Set an API key when the server requires one:
 export OPENAI_API_KEY="..."
 ```
 
+To use a different environment variable:
+
+```bash
+cargo run -- build \
+  --provider openai-compatible \
+  --model your-model \
+  --api-key-env HKB_API_KEY
+```
+
+Alternatively, read the key from a file:
+
+```bash
+cargo run -- build \
+  --provider openai-compatible \
+  --model your-model \
+  --api-key-file ~/.config/hkb/api-key
+```
+
 Then provide the model and, for non-default servers, the endpoint:
 
 ```bash
@@ -48,7 +66,9 @@ cargo run -- build \
   --endpoint https://example.com/v1
 ```
 
-The key is read from the environment and is never stored in the manifest or cache.
+`--api-key-file` takes precedence over `--api-key-env`. The key is never stored in the manifest,
+cache, or progress output. HKB deliberately does not accept a literal `--api-key` value because
+command-line arguments can be exposed through shell history and process inspection.
 
 ## Output
 
