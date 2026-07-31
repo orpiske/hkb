@@ -1,5 +1,11 @@
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationSource {
+    Cache,
+    Llm,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProgressEvent {
     DiscoveryStarted {
@@ -23,10 +29,19 @@ pub enum ProgressEvent {
         path: String,
         start_line: usize,
         end_line: usize,
+        source: GenerationSource,
     },
-    CacheHit,
-    LlmRequestStarted,
+    RetryScheduled {
+        index: usize,
+        path: String,
+        attempt: usize,
+        max_retries: usize,
+        delay_ms: u64,
+    },
     ChunkFinished {
+        index: usize,
+        path: String,
+        source: GenerationSource,
         generated_items: usize,
     },
     ValidationFinished {

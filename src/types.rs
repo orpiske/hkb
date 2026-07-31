@@ -102,6 +102,8 @@ pub struct GenerationConfig {
     pub endpoint: Option<String>,
     pub questions_per_chunk: usize,
     pub temperature: f32,
+    pub concurrency: usize,
+    pub max_retries: usize,
 }
 
 impl Default for GenerationConfig {
@@ -112,6 +114,8 @@ impl Default for GenerationConfig {
             endpoint: None,
             questions_per_chunk: 3,
             temperature: 0.2,
+            concurrency: 1,
+            max_retries: 2,
         }
     }
 }
@@ -223,6 +227,8 @@ mod tests {
         assert!(config.discovery.ignore_files.is_empty());
         assert_eq!(config.chunking.max_characters, 4_000);
         assert_eq!(config.generation.questions_per_chunk, 3);
+        assert_eq!(config.generation.concurrency, 1);
+        assert_eq!(config.generation.max_retries, 2);
         assert_eq!(
             config.export.output,
             std::path::PathBuf::from("dataset.jsonl")

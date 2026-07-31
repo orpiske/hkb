@@ -29,6 +29,33 @@ During a build, HKB reports every Markdown file it chunks and shows a live per-c
 The active status distinguishes LLM requests from cache hits and includes the source file and line
 range currently being processed.
 
+### Parallel Generation
+
+Use `--concurrency` to allow multiple chunks to be sent to the LLM at the same time:
+
+```bash
+cargo run -- build \
+  --repo /path/to/repository \
+  --model llama3.2 \
+  --concurrency 2
+```
+
+The default is `1`, preserving sequential behavior. Completed chunks are cached immediately, even
+while other requests are still running. HKB restores the original chunk order before validation
+and export, so changing concurrency does not reorder the dataset. Retryable failures use exponential
+backoff; configure the retry count with `--max-retries` (default: `2`).
+
+Ollama also limits parallel work on the server. To serve two requests concurrently, start it with a
+matching limit:
+
+```bash
+OLLAMA_NUM_PARALLEL=2 ollama serve
+```
+
+Higher concurrency can increase throughput, but Ollama's memory use grows with the number of
+parallel requests and their context lengths. Increase this setting gradually for the available
+hardware.
+
 ### Additional Ignore Rules
 
 Use `--ignore-file` to apply repository-relative gitignore-style exclusions without modifying the

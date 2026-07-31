@@ -35,6 +35,20 @@ pub enum LlmError {
     MissingCompletion,
 }
 
+impl LlmError {
+    pub(crate) fn is_retryable(&self) -> bool {
+        match self {
+            Self::Api { status, .. } => {
+                *status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+            }
+            Self::Http(source) => source.is_timeout() || source.is_connect(),
+            Self::InvalidJson { .. } | Self::UnexpectedSchema { .. } | Self::MissingCompletion => {
+                true
+            }
+        }
+    }
+}
+
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     async fn generate_questions(
@@ -305,7 +319,11 @@ mod tests {
         thread,
     };
 
-    use super::{LlmClient, OllamaClient, OpenAiCompatibleClient, parse_generated_questions};
+    use reqwest::StatusCode;
+
+    use super::{
+        LlmClient, LlmError, OllamaClient, OpenAiCompatibleClient, parse_generated_questions,
+    };
     use crate::types::GenerationConfig;
 
     #[test]
@@ -352,6 +370,26 @@ mod tests {
                 && message.contains("line 1 column")
                 && message.contains("response excerpt")
         }));
+    }
+
+    #[test]
+    fn retries_rate_limits_and_server_errors_but_not_authentication_errors() {
+        let rate_limit = LlmError::Api {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: String::new(),
+        };
+        let server_error = LlmError::Api {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body: String::new(),
+        };
+        let authentication = LlmError::Api {
+            status: StatusCode::UNAUTHORIZED,
+            body: String::new(),
+        };
+
+        assert!(rate_limit.is_retryable());
+        assert!(server_error.is_retryable());
+        assert!(!authentication.is_retryable());
     }
 
     #[tokio::test]

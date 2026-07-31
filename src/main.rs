@@ -2,6 +2,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::ExitCode,
+    sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
 
@@ -12,7 +13,7 @@ use hkb::{
         OpenAiCompatibleClient,
     },
     pipeline::{BuildError, BuildOutcome, build_dataset_with_progress},
-    progress::{ProgressEvent, ProgressReporter},
+    progress::{GenerationSource, ProgressEvent, ProgressReporter},
     types::{
         BuildConfig, CacheConfig, ChunkConfig, DiscoveryConfig, ExportConfig, GenerationConfig,
         InputScope, LlmProvider,
@@ -87,6 +88,14 @@ struct BuildArgs {
     /// LLM sampling temperature.
     #[arg(long, default_value_t = 0.2)]
     temperature: f32,
+
+    /// Maximum number of simultaneous LLM requests.
+    #[arg(long, default_value_t = 1)]
+    concurrency: usize,
+
+    /// Number of retries for transient or malformed LLM responses.
+    #[arg(long, default_value_t = 2)]
+    max_retries: usize,
 
     /// Cache directory, relative to the repository unless absolute.
     #[arg(long, default_value = ".hkb")]
@@ -194,6 +203,8 @@ async fn run(cli: Cli) -> Result<BuildOutcome, CliError> {
                     endpoint: Some(endpoint),
                     questions_per_chunk: args.questions_per_chunk,
                     temperature: args.temperature,
+                    concurrency: args.concurrency,
+                    max_retries: args.max_retries,
                 },
                 export: ExportConfig {
                     output: args.out,
@@ -256,6 +267,7 @@ fn print_summary(outcome: &BuildOutcome) {
 #[derive(Debug)]
 struct ConsoleProgress {
     bar: ProgressBar,
+    active_llm: AtomicUsize,
 }
 
 impl ConsoleProgress {
@@ -263,7 +275,10 @@ impl ConsoleProgress {
         let bar = ProgressBar::new_spinner();
         bar.set_style(spinner_style());
         bar.enable_steady_tick(Duration::from_millis(100));
-        Self { bar }
+        Self {
+            bar,
+            active_llm: AtomicUsize::new(0),
+        }
     }
 
     fn log(&self, message: impl AsRef<str>) {
@@ -293,6 +308,7 @@ impl ProgressReporter for ConsoleProgress {
                 self.log(format!("Chunked {} into {chunks} chunk(s)", path.display()));
             }
             ProgressEvent::GenerationStarted { total_chunks } => {
+                self.active_llm.store(0, Ordering::SeqCst);
                 self.bar.disable_steady_tick();
                 self.bar.set_length(total_chunks as u64);
                 self.bar.set_position(0);
@@ -308,23 +324,45 @@ impl ProgressReporter for ConsoleProgress {
                 path,
                 start_line,
                 end_line,
+                source,
             } => {
                 self.bar.set_length(total as u64);
-                self.bar.set_position(index.saturating_sub(1) as u64);
-                self.bar.set_prefix("prepare");
+                match source {
+                    GenerationSource::Cache => self.bar.set_prefix("cache"),
+                    GenerationSource::Llm => {
+                        let active = self.active_llm.fetch_add(1, Ordering::SeqCst) + 1;
+                        self.bar.set_prefix(format!("LLM {active} active"));
+                    }
+                }
                 self.bar
                     .set_message(format!("{path}:{start_line}-{end_line} ({index}/{total})"));
             }
-            ProgressEvent::CacheHit => {
-                self.bar.set_prefix("cache");
+            ProgressEvent::RetryScheduled {
+                index,
+                path,
+                attempt,
+                max_retries,
+                delay_ms,
+            } => {
+                self.log(format!(
+                    "Retry {attempt}/{max_retries} for {path} (chunk {index}) in {delay_ms} ms"
+                ));
             }
-            ProgressEvent::LlmRequestStarted => {
-                self.bar.set_prefix("LLM");
-            }
-            ProgressEvent::ChunkFinished { generated_items } => {
+            ProgressEvent::ChunkFinished {
+                index,
+                path,
+                source,
+                generated_items,
+            } => {
+                if source == GenerationSource::Llm {
+                    self.active_llm.fetch_sub(1, Ordering::SeqCst);
+                }
                 self.bar.inc(1);
-                self.bar
-                    .set_message(format!("received {generated_items} item(s)"));
+                let active = self.active_llm.load(Ordering::SeqCst);
+                self.bar.set_prefix(format!("LLM {active} active"));
+                self.bar.set_message(format!(
+                    "{path} (chunk {index}) produced {generated_items} item(s)"
+                ));
             }
             ProgressEvent::ValidationFinished {
                 accepted_items,
@@ -387,6 +425,8 @@ mod tests {
         assert_eq!(args.api_key_env, "OPENAI_API_KEY");
         assert!(args.api_key_file.is_none());
         assert!(args.ignore_files.is_empty());
+        assert_eq!(args.concurrency, 1);
+        assert_eq!(args.max_retries, 2);
         assert!(!args.no_cache);
         Ok(())
     }

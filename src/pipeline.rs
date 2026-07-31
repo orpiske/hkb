@@ -3,10 +3,13 @@ use std::{
     io::BufWriter,
     path::{Path, PathBuf},
     process::Command,
+    time::Duration,
 };
 
+use futures_util::{StreamExt, TryStreamExt, stream};
 use jiff::Timestamp;
 use thiserror::Error;
+use tokio::time::sleep;
 
 use crate::{
     cache::{CacheError, GenerationBatch, GenerationCache},
@@ -15,7 +18,7 @@ use crate::{
     export::{ExportError, write_alpaca_jsonl, write_manifest},
     identity::sha256_hex,
     llm::{GeneratedQa, LlmClient, LlmError},
-    progress::{NoopProgress, ProgressEvent, ProgressReporter},
+    progress::{GenerationSource, NoopProgress, ProgressEvent, ProgressReporter},
     prompt::{PROMPT_TEMPLATE, PROMPT_VERSION, build_qa_prompt},
     qa::{normalize_question, validate_and_deduplicate},
     types::{
@@ -90,6 +93,11 @@ pub async fn build_dataset_with_progress(
             "questions_per_chunk must be greater than zero",
         ));
     }
+    if config.generation.concurrency == 0 {
+        return Err(BuildError::InvalidConfig(
+            "concurrency must be greater than zero",
+        ));
+    }
     if config.generation.model.trim().is_empty() {
         return Err(BuildError::InvalidConfig("model must not be empty"));
     }
@@ -127,40 +135,18 @@ pub async fn build_dataset_with_progress(
         total_chunks: chunks.len(),
     });
     let cache = GenerationCache::new(&config.repository, &config.cache);
-    let mut generated_items = Vec::new();
-    for (chunk_index, chunk) in chunks.iter().enumerate() {
-        progress.report(ProgressEvent::ChunkStarted {
-            index: chunk_index + 1,
-            total: chunks.len(),
-            path: chunk.path.clone(),
-            start_line: chunk.start_line,
-            end_line: chunk.end_line,
-        });
-        let batch = if config.cache.enabled {
-            match cache.load(chunk, &config.generation)? {
-                Some(batch) => {
-                    progress.report(ProgressEvent::CacheHit);
-                    batch
-                }
-                None => {
-                    progress.report(ProgressEvent::LlmRequestStarted);
-                    let batch = generate_batch(client, chunk, config)
-                        .await
-                        .map_err(|source| llm_build_error(chunk, source))?;
-                    cache.store(chunk, &config.generation, &batch)?;
-                    batch
-                }
-            }
-        } else {
-            progress.report(ProgressEvent::LlmRequestStarted);
-            generate_batch(client, chunk, config)
-                .await
-                .map_err(|source| llm_build_error(chunk, source))?
-        };
+    let mut batches = stream::iter(chunks.iter().enumerate())
+        .map(|(index, chunk)| {
+            process_chunk(index, chunks.len(), chunk, client, config, &cache, progress)
+        })
+        .buffer_unordered(config.generation.concurrency)
+        .try_collect::<Vec<_>>()
+        .await?;
+    batches.sort_by_key(|(index, _)| *index);
 
-        progress.report(ProgressEvent::ChunkFinished {
-            generated_items: batch.items.len(),
-        });
+    let mut generated_items = Vec::new();
+    for (chunk_index, batch) in batches {
+        let chunk = &chunks[chunk_index];
         generated_items.extend(to_qa_items(
             chunk,
             batch.items,
@@ -228,6 +214,102 @@ pub async fn build_dataset_with_progress(
         manifest_path,
         manifest,
     })
+}
+
+async fn process_chunk(
+    index: usize,
+    total: usize,
+    chunk: &Chunk,
+    client: &dyn LlmClient,
+    config: &BuildConfig,
+    cache: &GenerationCache,
+    progress: &dyn ProgressReporter,
+) -> Result<(usize, GenerationBatch), BuildError> {
+    if config.cache.enabled
+        && let Some(batch) = cache.load(chunk, &config.generation)?
+    {
+        report_chunk_started(index, total, chunk, GenerationSource::Cache, progress);
+        report_chunk_finished(index, chunk, GenerationSource::Cache, &batch, progress);
+        return Ok((index, batch));
+    }
+
+    report_chunk_started(index, total, chunk, GenerationSource::Llm, progress);
+    let batch = generate_batch_with_retry(index, chunk, client, config, progress)
+        .await
+        .map_err(|source| llm_build_error(chunk, source))?;
+
+    // Store inside the chunk future so completed work survives a later failure or interruption.
+    if config.cache.enabled {
+        cache.store(chunk, &config.generation, &batch)?;
+    }
+    report_chunk_finished(index, chunk, GenerationSource::Llm, &batch, progress);
+
+    Ok((index, batch))
+}
+
+fn report_chunk_started(
+    index: usize,
+    total: usize,
+    chunk: &Chunk,
+    source: GenerationSource,
+    progress: &dyn ProgressReporter,
+) {
+    progress.report(ProgressEvent::ChunkStarted {
+        index: index + 1,
+        total,
+        path: chunk.path.clone(),
+        start_line: chunk.start_line,
+        end_line: chunk.end_line,
+        source,
+    });
+}
+
+fn report_chunk_finished(
+    index: usize,
+    chunk: &Chunk,
+    source: GenerationSource,
+    batch: &GenerationBatch,
+    progress: &dyn ProgressReporter,
+) {
+    progress.report(ProgressEvent::ChunkFinished {
+        index: index + 1,
+        path: chunk.path.clone(),
+        source,
+        generated_items: batch.items.len(),
+    });
+}
+
+async fn generate_batch_with_retry(
+    index: usize,
+    chunk: &Chunk,
+    client: &dyn LlmClient,
+    config: &BuildConfig,
+    progress: &dyn ProgressReporter,
+) -> Result<GenerationBatch, LlmError> {
+    let mut retries = 0;
+    loop {
+        match generate_batch(client, chunk, config).await {
+            Ok(batch) => return Ok(batch),
+            Err(error) if error.is_retryable() && retries < config.generation.max_retries => {
+                retries += 1;
+                let delay = retry_delay(retries);
+                progress.report(ProgressEvent::RetryScheduled {
+                    index: index + 1,
+                    path: chunk.path.clone(),
+                    attempt: retries,
+                    max_retries: config.generation.max_retries,
+                    delay_ms: delay.as_millis() as u64,
+                });
+                sleep(delay).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn retry_delay(attempt: usize) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(6) as u32;
+    Duration::from_millis(500 * 2_u64.pow(exponent))
 }
 
 async fn generate_batch(
@@ -328,15 +410,19 @@ mod tests {
             Mutex,
             atomic::{AtomicUsize, Ordering},
         },
+        time::Duration,
     };
 
     use async_trait::async_trait;
+    use reqwest::StatusCode;
+    use tokio::time::sleep;
 
     use super::{build_dataset, build_dataset_with_progress};
     use crate::{
+        export::AlpacaRecord,
         llm::{GeneratedQa, LlmClient, LlmError},
-        progress::{ProgressEvent, ProgressReporter},
-        types::{BuildConfig, ExportConfig, GenerationConfig},
+        progress::{GenerationSource, ProgressEvent, ProgressReporter},
+        types::{BuildConfig, CacheConfig, ExportConfig, GenerationConfig},
     };
 
     #[derive(Debug, Default)]
@@ -411,12 +497,20 @@ mod tests {
         let second_dataset = fs::read_to_string(&second.dataset_path)?;
 
         assert_eq!(client.calls.load(Ordering::SeqCst), 1);
-        assert!(
-            first_progress
-                .events()
-                .contains(&ProgressEvent::LlmRequestStarted)
-        );
-        assert!(second_progress.events().contains(&ProgressEvent::CacheHit));
+        assert!(first_progress.events().iter().any(|event| matches!(
+            event,
+            ProgressEvent::ChunkStarted {
+                source: GenerationSource::Llm,
+                ..
+            }
+        )));
+        assert!(second_progress.events().iter().any(|event| matches!(
+            event,
+            ProgressEvent::ChunkStarted {
+                source: GenerationSource::Cache,
+                ..
+            }
+        )));
         assert_eq!(first_dataset, second_dataset);
         assert!(first_dataset.contains("\"instruction\":\"What does HKB build?\""));
         assert_eq!(second.manifest.stats.generated_items, 1);
@@ -439,5 +533,217 @@ mod tests {
 
         assert!(matches!(result, Err(super::BuildError::InvalidConfig(_))));
         assert_eq!(client.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[derive(Debug, Default)]
+    struct ParallelClient {
+        active: AtomicUsize,
+        peak_active: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmClient for ParallelClient {
+        async fn generate_questions(
+            &self,
+            prompt: &str,
+            _config: &GenerationConfig,
+        ) -> Result<Vec<GeneratedQa>, LlmError> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_active.fetch_max(active, Ordering::SeqCst);
+
+            let (section, delay_ms) = if prompt.contains("# First") {
+                ("First", 80)
+            } else if prompt.contains("# Second") {
+                ("Second", 10)
+            } else {
+                ("Third", 20)
+            };
+            sleep(Duration::from_millis(delay_ms)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+
+            Ok(vec![GeneratedQa {
+                question: format!("What is in the {section} section?"),
+                answer: format!("The {section} section content."),
+                tags: Vec::new(),
+                confidence: None,
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn bounds_parallel_requests_and_preserves_source_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let repository = tempfile::tempdir()?;
+        fs::write(
+            repository.path().join("README.md"),
+            "# First\nFirst content.\n\n# Second\nSecond content.\n\n# Third\nThird content.",
+        )?;
+        let output = repository.path().join("dataset.jsonl");
+        let config = BuildConfig {
+            repository: repository.path().to_path_buf(),
+            generation: GenerationConfig {
+                concurrency: 2,
+                ..GenerationConfig::default()
+            },
+            export: ExportConfig {
+                output: output.clone(),
+                ..ExportConfig::default()
+            },
+            cache: CacheConfig {
+                enabled: false,
+                ..CacheConfig::default()
+            },
+            ..BuildConfig::default()
+        };
+        let client = ParallelClient::default();
+
+        build_dataset(&client, &config).await?;
+
+        let records = fs::read_to_string(output)?
+            .lines()
+            .map(serde_json::from_str::<AlpacaRecord>)
+            .collect::<Result<Vec<_>, _>>()?;
+        let questions = records
+            .iter()
+            .map(|record| record.instruction.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(client.peak_active.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            questions,
+            [
+                "What is in the First section?",
+                "What is in the Second section?",
+                "What is in the Third section?"
+            ]
+        );
+        Ok(())
+    }
+
+    #[derive(Debug, Default)]
+    struct FlakyClient {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmClient for FlakyClient {
+        async fn generate_questions(
+            &self,
+            _prompt: &str,
+            _config: &GenerationConfig,
+        ) -> Result<Vec<GeneratedQa>, LlmError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(LlmError::UnexpectedSchema {
+                    reason: "temporary malformed response".to_owned(),
+                    excerpt: "not JSON".to_owned(),
+                });
+            }
+
+            Ok(vec![GeneratedQa {
+                question: "What was retried?".to_owned(),
+                answer: "The LLM request.".to_owned(),
+                tags: Vec::new(),
+                confidence: None,
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_retryable_llm_errors() -> Result<(), Box<dyn std::error::Error>> {
+        let repository = tempfile::tempdir()?;
+        fs::write(repository.path().join("README.md"), "# Retry\nContent.")?;
+        let config = BuildConfig {
+            repository: repository.path().to_path_buf(),
+            generation: GenerationConfig {
+                max_retries: 1,
+                ..GenerationConfig::default()
+            },
+            export: ExportConfig {
+                output: repository.path().join("dataset.jsonl"),
+                ..ExportConfig::default()
+            },
+            cache: CacheConfig {
+                enabled: false,
+                ..CacheConfig::default()
+            },
+            ..BuildConfig::default()
+        };
+        let client = FlakyClient::default();
+        let progress = RecordingProgress::default();
+
+        build_dataset_with_progress(&client, &config, &progress).await?;
+
+        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
+        assert!(
+            progress
+                .events()
+                .iter()
+                .any(|event| matches!(event, ProgressEvent::RetryScheduled { attempt: 1, .. }))
+        );
+        Ok(())
+    }
+
+    #[derive(Debug, Default)]
+    struct PartiallyFailingClient;
+
+    #[async_trait]
+    impl LlmClient for PartiallyFailingClient {
+        async fn generate_questions(
+            &self,
+            prompt: &str,
+            _config: &GenerationConfig,
+        ) -> Result<Vec<GeneratedQa>, LlmError> {
+            if prompt.contains("# Successful") {
+                sleep(Duration::from_millis(10)).await;
+                return Ok(vec![GeneratedQa {
+                    question: "Which chunk succeeded?".to_owned(),
+                    answer: "The first chunk.".to_owned(),
+                    tags: Vec::new(),
+                    confidence: None,
+                }]);
+            }
+
+            sleep(Duration::from_millis(50)).await;
+            Err(LlmError::Api {
+                status: StatusCode::UNAUTHORIZED,
+                body: "test failure".to_owned(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn keeps_completed_cache_entries_when_another_chunk_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let repository = tempfile::tempdir()?;
+        fs::write(
+            repository.path().join("README.md"),
+            "# Successful\nThis chunk succeeds.\n\n# Failing\nThis chunk fails.",
+        )?;
+        let config = BuildConfig {
+            repository: repository.path().to_path_buf(),
+            generation: GenerationConfig {
+                concurrency: 2,
+                ..GenerationConfig::default()
+            },
+            export: ExportConfig {
+                output: repository.path().join("dataset.jsonl"),
+                ..ExportConfig::default()
+            },
+            ..BuildConfig::default()
+        };
+
+        let result = build_dataset(&PartiallyFailingClient, &config).await;
+
+        assert!(matches!(result, Err(super::BuildError::Llm { .. })));
+        let cache_entries =
+            fs::read_dir(repository.path().join(".hkb"))?.collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(cache_entries.len(), 1);
+        assert_eq!(
+            cache_entries[0]
+                .path()
+                .extension()
+                .and_then(|value| value.to_str()),
+            Some("json")
+        );
+        Ok(())
     }
 }
