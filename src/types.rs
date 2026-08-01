@@ -154,6 +154,8 @@ impl Default for CacheConfig {
 pub struct BuildConfig {
     pub repository: PathBuf,
     pub include: InputScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_file: Option<PathBuf>,
     pub discovery: DiscoveryConfig,
     pub chunking: ChunkConfig,
     pub generation: GenerationConfig,
@@ -166,6 +168,7 @@ impl Default for BuildConfig {
         Self {
             repository: PathBuf::from("."),
             include: InputScope::default(),
+            prompt_file: None,
             discovery: DiscoveryConfig::default(),
             chunking: ChunkConfig::default(),
             generation: GenerationConfig::default(),
@@ -223,6 +226,7 @@ mod tests {
 
         assert_eq!(config.repository, std::path::PathBuf::from("."));
         assert_eq!(config.include, InputScope::Docs);
+        assert!(config.prompt_file.is_none());
         assert!(config.discovery.respect_gitignore);
         assert!(config.discovery.ignore_files.is_empty());
         assert_eq!(config.chunking.max_characters, 4_000);

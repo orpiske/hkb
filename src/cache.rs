@@ -9,7 +9,6 @@ use thiserror::Error;
 use crate::{
     identity::sha256_hex,
     llm::GeneratedQa,
-    prompt::PROMPT_VERSION,
     types::{CacheConfig, Chunk, GenerationConfig},
 };
 
@@ -39,8 +38,9 @@ impl GenerationCache {
         &self,
         chunk: &Chunk,
         config: &GenerationConfig,
+        prompt_template: &str,
     ) -> Result<Option<GenerationBatch>, CacheError> {
-        let path = self.entry_path(chunk, config)?;
+        let path = self.entry_path(chunk, config, prompt_template)?;
         match fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map(Some)
@@ -54,6 +54,7 @@ impl GenerationCache {
         &self,
         chunk: &Chunk,
         config: &GenerationConfig,
+        prompt_template: &str,
         batch: &GenerationBatch,
     ) -> Result<(), CacheError> {
         fs::create_dir_all(&self.directory).map_err(|source| CacheError::Io {
@@ -61,7 +62,7 @@ impl GenerationCache {
             source,
         })?;
 
-        let path = self.entry_path(chunk, config)?;
+        let path = self.entry_path(chunk, config, prompt_template)?;
         let temporary_path = path.with_extension("json.tmp");
         let bytes = serde_json::to_vec_pretty(batch).map_err(|source| CacheError::Json {
             path: path.clone(),
@@ -75,10 +76,15 @@ impl GenerationCache {
         Ok(())
     }
 
-    fn entry_path(&self, chunk: &Chunk, config: &GenerationConfig) -> Result<PathBuf, CacheError> {
+    fn entry_path(
+        &self,
+        chunk: &Chunk,
+        config: &GenerationConfig,
+        prompt_template: &str,
+    ) -> Result<PathBuf, CacheError> {
         let identity = CacheIdentity {
             chunk_id: &chunk.chunk_id,
-            prompt_version: PROMPT_VERSION,
+            prompt_hash: sha256_hex(prompt_template.as_bytes()),
             provider: config.provider,
             model: &config.model,
             endpoint: config.endpoint.as_deref(),
@@ -93,7 +99,7 @@ impl GenerationCache {
 #[derive(Debug, Serialize)]
 struct CacheIdentity<'a> {
     chunk_id: &'a str,
-    prompt_version: &'a str,
+    prompt_hash: String,
     provider: crate::types::LlmProvider,
     model: &'a str,
     endpoint: Option<&'a str>,
@@ -150,11 +156,51 @@ mod tests {
             }],
         };
 
-        assert_eq!(cache.load(&chunk, &GenerationConfig::default())?, None);
-        cache.store(&chunk, &GenerationConfig::default(), &batch)?;
+        let prompt = "Generate from {{chunk_text}}";
         assert_eq!(
-            cache.load(&chunk, &GenerationConfig::default())?,
+            cache.load(&chunk, &GenerationConfig::default(), prompt)?,
+            None
+        );
+        cache.store(&chunk, &GenerationConfig::default(), prompt, &batch)?;
+        assert_eq!(
+            cache.load(&chunk, &GenerationConfig::default(), prompt)?,
             Some(batch)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn changing_the_prompt_invalidates_the_cache() -> Result<(), Box<dyn std::error::Error>> {
+        let repository = tempfile::tempdir()?;
+        let cache = GenerationCache::new(repository.path(), &CacheConfig::default());
+        let chunk = Chunk {
+            chunk_id: "chunk-1".to_owned(),
+            path: "README.md".to_owned(),
+            language: "markdown".to_owned(),
+            start_line: 1,
+            end_line: 1,
+            content_hash: "content-hash".to_owned(),
+            text: "# HKB".to_owned(),
+        };
+        let batch = GenerationBatch {
+            generated_at: "2026-08-01T10:00:00Z".to_owned(),
+            items: Vec::new(),
+        };
+
+        cache.store(
+            &chunk,
+            &GenerationConfig::default(),
+            "First {{chunk_text}}",
+            &batch,
+        )?;
+
+        assert_eq!(
+            cache.load(
+                &chunk,
+                &GenerationConfig::default(),
+                "Second {{chunk_text}}"
+            )?,
+            None
         );
         Ok(())
     }

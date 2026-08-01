@@ -72,6 +72,14 @@ pub fn discover_markdown(
     repository: &Path,
     config: &DiscoveryConfig,
 ) -> Result<DiscoveryReport, DiscoveryError> {
+    discover_markdown_excluding(repository, config, &[])
+}
+
+pub(crate) fn discover_markdown_excluding(
+    repository: &Path,
+    config: &DiscoveryConfig,
+    excluded_paths: &[PathBuf],
+) -> Result<DiscoveryReport, DiscoveryError> {
     if !repository.is_dir() {
         return Err(DiscoveryError::NotDirectory(repository.to_path_buf()));
     }
@@ -99,6 +107,10 @@ pub fn discover_markdown(
                 .is_ignore()
         });
 
+    let excluded_paths = excluded_paths
+        .iter()
+        .filter_map(|path| fs::canonicalize(path).ok())
+        .collect::<Vec<_>>();
     let mut candidates = Vec::new();
     for entry in builder.build() {
         let entry = entry?;
@@ -106,6 +118,7 @@ pub fn discover_markdown(
             .file_type()
             .is_some_and(|file_type| file_type.is_file())
             && is_markdown(entry.path())
+            && !is_excluded(entry.path(), &excluded_paths)
         {
             candidates.push(entry.into_path());
         }
@@ -167,6 +180,12 @@ pub fn discover_markdown(
     Ok(report)
 }
 
+fn is_excluded(path: &Path, excluded_paths: &[PathBuf]) -> bool {
+    fs::canonicalize(path)
+        .ok()
+        .is_some_and(|path| excluded_paths.contains(&path))
+}
+
 fn build_custom_ignores(
     repository: &Path,
     ignore_files: &[PathBuf],
@@ -221,7 +240,7 @@ fn normalize_line_endings(text: &str) -> String {
 mod tests {
     use std::{fs, path::PathBuf};
 
-    use super::{SkipReason, discover_markdown};
+    use super::{SkipReason, discover_markdown, discover_markdown_excluding};
     use crate::types::DiscoveryConfig;
 
     #[test]
@@ -268,6 +287,26 @@ mod tests {
             report.documents[0].path,
             std::path::PathBuf::from("ignored.md")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn excludes_configuration_files_before_applying_the_file_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let repository = tempfile::tempdir()?;
+        let prompt = repository.path().join("a-prompt.md");
+        fs::write(&prompt, "{{chunk_text}}")?;
+        fs::write(repository.path().join("b-readme.md"), "# Documentation")?;
+        let config = DiscoveryConfig {
+            max_files: Some(1),
+            ..DiscoveryConfig::default()
+        };
+
+        let report = discover_markdown_excluding(repository.path(), &config, &[prompt])?;
+
+        assert_eq!(report.discovered_files, 1);
+        assert_eq!(report.documents.len(), 1);
+        assert_eq!(report.documents[0].path, PathBuf::from("b-readme.md"));
         Ok(())
     }
 

@@ -14,12 +14,12 @@ use tokio::time::sleep;
 use crate::{
     cache::{CacheError, GenerationBatch, GenerationCache},
     chunker::{ChunkError, chunk_markdown},
-    discover::{DiscoveryError, discover_markdown},
+    discover::{DiscoveryError, discover_markdown_excluding},
     export::{ExportError, write_alpaca_jsonl, write_manifest},
     identity::sha256_hex,
     llm::{GeneratedQa, LlmClient, LlmError},
     progress::{GenerationSource, NoopProgress, ProgressEvent, ProgressReporter},
-    prompt::{PROMPT_TEMPLATE, PROMPT_VERSION, build_qa_prompt},
+    prompt::{PromptError, QaPromptTemplate, build_qa_prompt, load_qa_prompt},
     qa::{normalize_question, validate_and_deduplicate},
     types::{
         BuildConfig, BuildManifest, BuildStats, Chunk, InputScope, PromptMetadata, QaItem,
@@ -48,6 +48,8 @@ pub enum BuildError {
     Discovery(#[from] DiscoveryError),
     #[error(transparent)]
     Chunk(#[from] ChunkError),
+    #[error(transparent)]
+    Prompt(#[from] PromptError),
     #[error("LLM generation failed for {path}:{start_line}-{end_line}: {source}")]
     Llm {
         path: String,
@@ -104,11 +106,18 @@ pub async fn build_dataset_with_progress(
     if !config.generation.temperature.is_finite() {
         return Err(BuildError::InvalidConfig("temperature must be finite"));
     }
+    let prompt_template = load_qa_prompt(&config.repository, config.prompt_file.as_deref())?;
 
     progress.report(ProgressEvent::DiscoveryStarted {
         repository: config.repository.clone(),
     });
-    let discovery = discover_markdown(&config.repository, &config.discovery)?;
+    let prompt_files = prompt_template
+        .source_path
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let discovery =
+        discover_markdown_excluding(&config.repository, &config.discovery, &prompt_files)?;
     if discovery.documents.is_empty() {
         return Err(BuildError::NoDocuments);
     }
@@ -135,10 +144,16 @@ pub async fn build_dataset_with_progress(
         total_chunks: chunks.len(),
     });
     let cache = GenerationCache::new(&config.repository, &config.cache);
+    let generation_context = ChunkGenerationContext {
+        total: chunks.len(),
+        client,
+        config,
+        prompt_template: &prompt_template,
+        cache: &cache,
+        progress,
+    };
     let mut batches = stream::iter(chunks.iter().enumerate())
-        .map(|(index, chunk)| {
-            process_chunk(index, chunks.len(), chunk, client, config, &cache, progress)
-        })
+        .map(|(index, chunk)| process_chunk(index, chunk, &generation_context))
         .buffer_unordered(config.generation.concurrency)
         .try_collect::<Vec<_>>()
         .await?;
@@ -180,8 +195,8 @@ pub async fn build_dataset_with_progress(
         },
         config: config.clone(),
         prompt: PromptMetadata {
-            version: PROMPT_VERSION.to_owned(),
-            template: PROMPT_TEMPLATE.to_owned(),
+            version: prompt_template.version,
+            template: prompt_template.template,
         },
         stats,
     };
@@ -216,33 +231,78 @@ pub async fn build_dataset_with_progress(
     })
 }
 
+struct ChunkGenerationContext<'a> {
+    total: usize,
+    client: &'a dyn LlmClient,
+    config: &'a BuildConfig,
+    prompt_template: &'a QaPromptTemplate,
+    cache: &'a GenerationCache,
+    progress: &'a dyn ProgressReporter,
+}
+
 async fn process_chunk(
     index: usize,
-    total: usize,
     chunk: &Chunk,
-    client: &dyn LlmClient,
-    config: &BuildConfig,
-    cache: &GenerationCache,
-    progress: &dyn ProgressReporter,
+    context: &ChunkGenerationContext<'_>,
 ) -> Result<(usize, GenerationBatch), BuildError> {
-    if config.cache.enabled
-        && let Some(batch) = cache.load(chunk, &config.generation)?
+    if context.config.cache.enabled
+        && let Some(batch) = context.cache.load(
+            chunk,
+            &context.config.generation,
+            &context.prompt_template.template,
+        )?
     {
-        report_chunk_started(index, total, chunk, GenerationSource::Cache, progress);
-        report_chunk_finished(index, chunk, GenerationSource::Cache, &batch, progress);
+        report_chunk_started(
+            index,
+            context.total,
+            chunk,
+            GenerationSource::Cache,
+            context.progress,
+        );
+        report_chunk_finished(
+            index,
+            chunk,
+            GenerationSource::Cache,
+            &batch,
+            context.progress,
+        );
         return Ok((index, batch));
     }
 
-    report_chunk_started(index, total, chunk, GenerationSource::Llm, progress);
-    let batch = generate_batch_with_retry(index, chunk, client, config, progress)
-        .await
-        .map_err(|source| llm_build_error(chunk, source))?;
+    report_chunk_started(
+        index,
+        context.total,
+        chunk,
+        GenerationSource::Llm,
+        context.progress,
+    );
+    let batch = generate_batch_with_retry(
+        index,
+        chunk,
+        context.client,
+        context.config,
+        &context.prompt_template.template,
+        context.progress,
+    )
+    .await
+    .map_err(|source| llm_build_error(chunk, source))?;
 
     // Store inside the chunk future so completed work survives a later failure or interruption.
-    if config.cache.enabled {
-        cache.store(chunk, &config.generation, &batch)?;
+    if context.config.cache.enabled {
+        context.cache.store(
+            chunk,
+            &context.config.generation,
+            &context.prompt_template.template,
+            &batch,
+        )?;
     }
-    report_chunk_finished(index, chunk, GenerationSource::Llm, &batch, progress);
+    report_chunk_finished(
+        index,
+        chunk,
+        GenerationSource::Llm,
+        &batch,
+        context.progress,
+    );
 
     Ok((index, batch))
 }
@@ -284,11 +344,12 @@ async fn generate_batch_with_retry(
     chunk: &Chunk,
     client: &dyn LlmClient,
     config: &BuildConfig,
+    prompt_template: &str,
     progress: &dyn ProgressReporter,
 ) -> Result<GenerationBatch, LlmError> {
     let mut retries = 0;
     loop {
-        match generate_batch(client, chunk, config).await {
+        match generate_batch(client, chunk, config, prompt_template).await {
             Ok(batch) => return Ok(batch),
             Err(error) if error.is_retryable() && retries < config.generation.max_retries => {
                 retries += 1;
@@ -316,8 +377,13 @@ async fn generate_batch(
     client: &dyn LlmClient,
     chunk: &Chunk,
     config: &BuildConfig,
+    prompt_template: &str,
 ) -> Result<GenerationBatch, LlmError> {
-    let prompt = build_qa_prompt(chunk, config.generation.questions_per_chunk);
+    let prompt = build_qa_prompt(
+        prompt_template,
+        chunk,
+        config.generation.questions_per_chunk,
+    );
     let items = client
         .generate_questions(&prompt, &config.generation)
         .await?;
@@ -448,6 +514,31 @@ mod tests {
     }
 
     #[derive(Debug, Default)]
+    struct PromptCapturingClient {
+        prompts: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl LlmClient for PromptCapturingClient {
+        async fn generate_questions(
+            &self,
+            prompt: &str,
+            _config: &GenerationConfig,
+        ) -> Result<Vec<GeneratedQa>, LlmError> {
+            match self.prompts.lock() {
+                Ok(mut prompts) => prompts.push(prompt.to_owned()),
+                Err(poisoned) => poisoned.into_inner().push(prompt.to_owned()),
+            }
+            Ok(vec![GeneratedQa {
+                question: "What is documented?".to_owned(),
+                answer: "Project knowledge.".to_owned(),
+                tags: Vec::new(),
+                confidence: None,
+            }])
+        }
+    }
+
+    #[derive(Debug, Default)]
     struct RecordingProgress {
         events: Mutex<Vec<ProgressEvent>>,
     }
@@ -515,6 +606,47 @@ mod tests {
         assert!(first_dataset.contains("\"instruction\":\"What does HKB build?\""));
         assert_eq!(second.manifest.stats.generated_items, 1);
         assert!(second.manifest_path.is_file());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn uses_and_records_a_project_specific_prompt() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let repository = tempfile::tempdir()?;
+        fs::write(
+            repository.path().join("README.md"),
+            "# HKB\nProject knowledge.",
+        )?;
+        let template = "Create one project question from {{path}}:\n{{chunk_text}}";
+        fs::write(repository.path().join("hkb-prompt.md"), template)?;
+        let config = BuildConfig {
+            repository: repository.path().to_path_buf(),
+            prompt_file: Some("hkb-prompt.md".into()),
+            export: ExportConfig {
+                output: repository.path().join("dataset.jsonl"),
+                ..ExportConfig::default()
+            },
+            cache: CacheConfig {
+                enabled: false,
+                ..CacheConfig::default()
+            },
+            ..BuildConfig::default()
+        };
+        let client = PromptCapturingClient::default();
+
+        let outcome = build_dataset(&client, &config).await?;
+
+        let prompts = match client.prompts.lock() {
+            Ok(prompts) => prompts,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        assert_eq!(
+            prompts.as_slice(),
+            ["Create one project question from README.md:\n# HKB\nProject knowledge."]
+        );
+        assert_eq!(outcome.manifest.prompt.version, "custom");
+        assert_eq!(outcome.manifest.prompt.template, template);
+        assert_eq!(outcome.manifest.stats.processed_files, 1);
         Ok(())
     }
 

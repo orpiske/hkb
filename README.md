@@ -29,6 +29,29 @@ During a build, HKB reports every Markdown file it chunks and shows a live per-c
 The active status distinguishes LLM requests from cache hits and includes the source file and line
 range currently being processed.
 
+### Project-Specific Prompts
+
+The default Q&A prompt lives in `prompts/qa-v1.md`. To customize generation for a project, create a
+prompt file in that repository and pass its repository-relative path:
+
+```bash
+cargo run -- build \
+  --repo /path/to/repository \
+  --prompt-file hkb-prompt.md
+```
+
+Custom templates must contain `{{chunk_text}}` so generated answers remain grounded in the source.
+They may also use these placeholders:
+
+- `{{questions_per_chunk}}`
+- `{{path}}`
+- `{{start_line}}`
+- `{{end_line}}`
+
+Absolute prompt paths are also accepted. The resolved prompt text is recorded in `manifest.json`
+and included in the cache identity, so changing the prompt invalidates only the affected cached
+generations.
+
 ### Parallel Generation
 
 Use `--concurrency` to allow multiple chunks to be sent to the LLM at the same time:
@@ -144,7 +167,7 @@ command-line arguments can be exposed through shell history and process inspecti
 Git commit when available, and processing statistics.
 
 Cached generations are stored under `.hkb` by default. A cache entry is invalidated when the chunk,
-provider, endpoint, model, prompt version, temperature, or requested question count changes.
+provider, endpoint, model, prompt contents, temperature, or requested question count changes.
 
 ## Quality Checks
 

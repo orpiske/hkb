@@ -69,6 +69,10 @@ struct BuildArgs {
     #[arg(long = "ignore-file", value_name = "PATH")]
     ignore_files: Vec<PathBuf>,
 
+    /// Use a custom prompt template, relative to the repository unless absolute.
+    #[arg(long, value_name = "PATH")]
+    prompt_file: Option<PathBuf>,
+
     /// Maximum number of Markdown files to process.
     #[arg(long)]
     max_files: Option<usize>,
@@ -188,6 +192,7 @@ async fn run(cli: Cli) -> Result<BuildOutcome, CliError> {
             let config = BuildConfig {
                 repository: args.repo,
                 include: InputScope::Docs,
+                prompt_file: args.prompt_file,
                 discovery: DiscoveryConfig {
                     respect_gitignore: !args.no_gitignore,
                     ignore_files: args.ignore_files,
@@ -425,6 +430,7 @@ mod tests {
         assert_eq!(args.api_key_env, "OPENAI_API_KEY");
         assert!(args.api_key_file.is_none());
         assert!(args.ignore_files.is_empty());
+        assert!(args.prompt_file.is_none());
         assert_eq!(args.concurrency, 1);
         assert_eq!(args.max_retries, 2);
         assert!(!args.no_cache);
@@ -466,6 +472,18 @@ mod tests {
                 std::path::PathBuf::from("first.ignore"),
                 std::path::PathBuf::from("second.ignore")
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_a_project_prompt_file() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["hkb", "build", "--prompt-file", "hkb-prompt.md"])?;
+        let Command::Build(args) = cli.command;
+
+        assert_eq!(
+            args.prompt_file,
+            Some(std::path::PathBuf::from("hkb-prompt.md"))
         );
         Ok(())
     }
