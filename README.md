@@ -142,6 +142,13 @@ command-line arguments can be exposed through shell history and process inspecti
 
 ## Output
 
+`--out` accepts either a JSONL file path or an existing directory. For a directory, HKB writes
+`dataset.jsonl` and `manifest.json` inside it:
+
+```bash
+cargo run -- build --repo /path/to/repository --out /path/to/output-directory
+```
+
 `dataset.jsonl` contains one extended Alpaca record per line:
 
 ```json

@@ -62,7 +62,7 @@ pub enum BuildError {
     Cache(#[from] CacheError),
     #[error(transparent)]
     Export(#[from] ExportError),
-    #[error("output I/O failed for {path}")]
+    #[error("output I/O failed for {path}: {source}")]
     OutputIo {
         path: PathBuf,
         #[source]
@@ -107,6 +107,8 @@ pub async fn build_dataset_with_progress(
         return Err(BuildError::InvalidConfig("temperature must be finite"));
     }
     let prompt_template = load_qa_prompt(&config.repository, config.prompt_file.as_deref())?;
+    let (dataset_path, manifest_path) = resolve_output_paths(&config.export.output);
+    create_parent_directory(&dataset_path)?;
 
     progress.report(ProgressEvent::DiscoveryStarted {
         repository: config.repository.clone(),
@@ -201,16 +203,10 @@ pub async fn build_dataset_with_progress(
         stats,
     };
 
-    let dataset_path = config.export.output.clone();
-    let manifest_path = dataset_path
-        .parent()
-        .unwrap_or_else(|| Path::new(""))
-        .join("manifest.json");
     progress.report(ProgressEvent::WritingOutput {
         dataset_path: dataset_path.clone(),
         manifest_path: manifest_path.clone(),
     });
-    create_parent_directory(&dataset_path)?;
     let dataset_file = File::create(&dataset_path).map_err(|source| BuildError::OutputIo {
         path: dataset_path.clone(),
         source,
@@ -229,6 +225,19 @@ pub async fn build_dataset_with_progress(
         manifest_path,
         manifest,
     })
+}
+
+fn resolve_output_paths(output: &Path) -> (PathBuf, PathBuf) {
+    let dataset_path = if output.is_dir() {
+        output.join("dataset.jsonl")
+    } else {
+        output.to_path_buf()
+    };
+    let manifest_path = dataset_path
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join("manifest.json");
+    (dataset_path, manifest_path)
 }
 
 struct ChunkGenerationContext<'a> {
@@ -606,6 +615,37 @@ mod tests {
         assert!(first_dataset.contains("\"instruction\":\"What does HKB build?\""));
         assert_eq!(second.manifest.stats.generated_items, 1);
         assert!(second.manifest_path.is_file());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writes_default_filenames_when_output_is_a_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let repository = tempfile::tempdir()?;
+        fs::write(
+            repository.path().join("README.md"),
+            "# HKB\nBuild datasets.",
+        )?;
+        let output_directory = repository.path().join("generated");
+        fs::create_dir(&output_directory)?;
+        let config = BuildConfig {
+            repository: repository.path().to_path_buf(),
+            export: ExportConfig {
+                output: output_directory.clone(),
+                ..ExportConfig::default()
+            },
+            ..BuildConfig::default()
+        };
+
+        let outcome = build_dataset(&FakeClient::default(), &config).await?;
+
+        assert_eq!(outcome.dataset_path, output_directory.join("dataset.jsonl"));
+        assert_eq!(
+            outcome.manifest_path,
+            output_directory.join("manifest.json")
+        );
+        assert!(outcome.dataset_path.is_file());
+        assert!(outcome.manifest_path.is_file());
         Ok(())
     }
 

@@ -41,7 +41,7 @@ struct BuildArgs {
     #[arg(long, default_value = ".")]
     repo: PathBuf,
 
-    /// Alpaca JSONL output path.
+    /// Alpaca JSONL output path, or an existing directory.
     #[arg(long, default_value = "dataset.jsonl")]
     out: PathBuf,
 
