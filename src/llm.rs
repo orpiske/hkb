@@ -170,6 +170,21 @@ struct OpenAiRequest<'a> {
     model: &'a str,
     messages: [OpenAiMessage<'a>; 1],
     temperature: f32,
+    response_format: OpenAiResponseFormat<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiResponseFormat<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    json_schema: OpenAiJsonSchema<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiJsonSchema<'a> {
+    name: &'static str,
+    strict: bool,
+    schema: &'a serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -199,7 +214,7 @@ impl LlmClient for OpenAiCompatibleClient {
         &self,
         prompt: &str,
         config: &LlmRequestConfig<'_>,
-        _response_schema: &serde_json::Value,
+        response_schema: &serde_json::Value,
     ) -> Result<String, LlmError> {
         let mut request = self
             .http
@@ -211,6 +226,14 @@ impl LlmClient for OpenAiCompatibleClient {
                     content: prompt,
                 }],
                 temperature: config.temperature,
+                response_format: OpenAiResponseFormat {
+                    kind: "json_schema",
+                    json_schema: OpenAiJsonSchema {
+                        name: "hkb_response",
+                        strict: true,
+                        schema: response_schema,
+                    },
+                },
             });
         if let Some(api_key) = &self.api_key {
             request = request.bearer_auth(api_key);
@@ -461,6 +484,9 @@ mod tests {
                 .to_lowercase()
                 .contains("authorization: bearer secret")
         );
+        assert!(request.contains("\"response_format\":{\"type\":\"json_schema\""));
+        assert!(request.contains("\"name\":\"hkb_response\",\"strict\":true"));
+        assert!(request.contains("\"required\":[\"items\"]"));
         Ok(())
     }
 

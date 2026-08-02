@@ -615,7 +615,7 @@ async fn verify_once(
         serde_json::from_value(parse_json_completion(&completion)?).map_err(|source| {
             LlmError::UnexpectedSchema {
                 reason: source.to_string(),
-                excerpt: completion.chars().take(500).collect(),
+                excerpt: completion.chars().take(2_000).collect(),
             }
         })?;
     generated.validate(chunk)?;
@@ -672,9 +672,14 @@ fn verification_schema() -> serde_json::Value {
             "grounded": check,
             "self_contained": check,
             "answer_relevant": check,
-            "evidence": { "type": ["string", "null"] }
+            "evidence": {
+                "anyOf": [
+                    { "type": "string" },
+                    { "type": "null" }
+                ]
+            }
         },
-        "required": ["grounded", "self_contained", "answer_relevant"],
+        "required": ["grounded", "self_contained", "answer_relevant", "evidence"],
         "additionalProperties": false
     })
 }
