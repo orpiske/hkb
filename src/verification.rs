@@ -618,7 +618,7 @@ async fn verify_once(
                 excerpt: completion.chars().take(2_000).collect(),
             }
         })?;
-    generated.validate(chunk)?;
+    generated.validate()?;
     Ok(generated)
 }
 
@@ -631,7 +631,7 @@ struct GeneratedVerification {
 }
 
 impl GeneratedVerification {
-    fn validate(&self, chunk: &Chunk) -> Result<(), LlmError> {
+    fn validate(&self) -> Result<(), LlmError> {
         for (name, check) in [
             ("grounded", &self.checks.grounded),
             ("self_contained", &self.checks.self_contained),
@@ -644,12 +644,14 @@ impl GeneratedVerification {
                 });
             }
         }
-        if let Some(evidence) = self.evidence.as_deref().map(str::trim)
-            && (evidence.is_empty() || !chunk.text.contains(evidence))
+        if self
+            .evidence
+            .as_deref()
+            .is_some_and(|evidence| evidence.trim().is_empty())
         {
             return Err(LlmError::UnexpectedSchema {
-                reason: "evidence must be an exact, non-empty excerpt from the source".to_owned(),
-                excerpt: evidence.to_owned(),
+                reason: "evidence must be non-empty when present".to_owned(),
+                excerpt: String::new(),
             });
         }
         Ok(())
@@ -674,7 +676,7 @@ fn verification_schema() -> serde_json::Value {
             "answer_relevant": check,
             "evidence": {
                 "anyOf": [
-                    { "type": "string" },
+                    { "type": "string", "minLength": 1 },
                     { "type": "null" }
                 ]
             }
@@ -967,7 +969,7 @@ mod tests {
                     "passed": true,
                     "reason": "The answer addresses the question."
                 },
-                "evidence": "HKB builds datasets."
+                "evidence": "The documentation states that HKB creates datasets."
             })
             .to_string())
         }

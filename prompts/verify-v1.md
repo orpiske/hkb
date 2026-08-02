@@ -5,7 +5,7 @@ Check all three criteria independently:
 3. answer_relevant: the answer directly and sufficiently addresses the question.
 
 Return JSON with this shape:
-{"grounded":{"passed":true,"reason":"..."},"self_contained":{"passed":true,"reason":"..."},"answer_relevant":{"passed":true,"reason":"..."},"evidence":"short source excerpt or null"}
+{"grounded":{"passed":true,"reason":"..."},"self_contained":{"passed":true,"reason":"..."},"answer_relevant":{"passed":true,"reason":"..."},"evidence":"brief supporting evidence grounded in the source, or null"}
 
 Question: {{question}}
 Answer: {{answer}}
