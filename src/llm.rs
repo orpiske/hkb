@@ -17,6 +17,12 @@ pub struct GeneratedQa {
     pub confidence: Option<f32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct LlmRequestConfig<'a> {
+    pub model: &'a str,
+    pub temperature: f32,
+}
+
 #[derive(Debug, Error)]
 pub enum LlmError {
     #[error("LLM HTTP request failed")]
@@ -51,11 +57,28 @@ impl LlmError {
 
 #[async_trait]
 pub trait LlmClient: Send + Sync {
-    async fn generate_questions(
+    async fn complete_structured(
         &self,
         prompt: &str,
-        config: &GenerationConfig,
-    ) -> Result<Vec<GeneratedQa>, LlmError>;
+        config: &LlmRequestConfig<'_>,
+        response_schema: &serde_json::Value,
+    ) -> Result<String, LlmError>;
+}
+
+pub async fn generate_questions(
+    client: &dyn LlmClient,
+    prompt: &str,
+    config: &GenerationConfig,
+) -> Result<Vec<GeneratedQa>, LlmError> {
+    let response_schema = generated_response_schema(config.questions_per_chunk);
+    let request_config = LlmRequestConfig {
+        model: &config.model,
+        temperature: config.temperature,
+    };
+    let completion = client
+        .complete_structured(prompt, &request_config, &response_schema)
+        .await?;
+    parse_generated_questions(&completion)
 }
 
 #[derive(Debug, Clone)]
@@ -94,20 +117,20 @@ struct OllamaResponse {
 
 #[async_trait]
 impl LlmClient for OllamaClient {
-    async fn generate_questions(
+    async fn complete_structured(
         &self,
         prompt: &str,
-        config: &GenerationConfig,
-    ) -> Result<Vec<GeneratedQa>, LlmError> {
-        let response_schema = generated_response_schema(config.questions_per_chunk);
+        config: &LlmRequestConfig<'_>,
+        response_schema: &serde_json::Value,
+    ) -> Result<String, LlmError> {
         let response = self
             .http
             .post(format!("{}/api/generate", self.endpoint))
             .json(&OllamaRequest {
-                model: &config.model,
+                model: config.model,
                 prompt,
                 stream: false,
-                format: &response_schema,
+                format: response_schema,
                 options: OllamaOptions {
                     temperature: config.temperature,
                 },
@@ -121,7 +144,7 @@ impl LlmClient for OllamaClient {
                 excerpt: response_excerpt(&body),
             })?;
 
-        parse_generated_questions(&response.response)
+        Ok(response.response)
     }
 }
 
@@ -172,16 +195,17 @@ struct OpenAiResponseMessage {
 
 #[async_trait]
 impl LlmClient for OpenAiCompatibleClient {
-    async fn generate_questions(
+    async fn complete_structured(
         &self,
         prompt: &str,
-        config: &GenerationConfig,
-    ) -> Result<Vec<GeneratedQa>, LlmError> {
+        config: &LlmRequestConfig<'_>,
+        _response_schema: &serde_json::Value,
+    ) -> Result<String, LlmError> {
         let mut request = self
             .http
             .post(format!("{}/chat/completions", self.endpoint))
             .json(&OpenAiRequest {
-                model: &config.model,
+                model: config.model,
                 messages: [OpenAiMessage {
                     role: "user",
                     content: prompt,
@@ -205,7 +229,7 @@ impl LlmClient for OpenAiCompatibleClient {
             .next()
             .ok_or(LlmError::MissingCompletion)?;
 
-        parse_generated_questions(&completion.message.content)
+        Ok(completion.message.content)
     }
 }
 
@@ -219,12 +243,7 @@ async fn checked_body(response: reqwest::Response) -> Result<String, LlmError> {
 }
 
 fn parse_generated_questions(raw: &str) -> Result<Vec<GeneratedQa>, LlmError> {
-    let json = json_candidate(raw);
-    let value: serde_json::Value =
-        serde_json::from_str(json).map_err(|source| LlmError::InvalidJson {
-            source,
-            excerpt: response_excerpt(raw),
-        })?;
+    let value = parse_json_completion(raw)?;
     let items = match value {
         serde_json::Value::Array(items) => items,
         serde_json::Value::Object(mut object) => object
@@ -248,6 +267,13 @@ fn parse_generated_questions(raw: &str) -> Result<Vec<GeneratedQa>, LlmError> {
             reason: source.to_string(),
             excerpt: response_excerpt(raw),
         }
+    })
+}
+
+pub(crate) fn parse_json_completion(raw: &str) -> Result<serde_json::Value, LlmError> {
+    serde_json::from_str(json_candidate(raw)).map_err(|source| LlmError::InvalidJson {
+        source,
+        excerpt: response_excerpt(raw),
     })
 }
 
@@ -322,7 +348,8 @@ mod tests {
     use reqwest::StatusCode;
 
     use super::{
-        LlmClient, LlmError, OllamaClient, OpenAiCompatibleClient, parse_generated_questions,
+        LlmError, OllamaClient, OpenAiCompatibleClient, generate_questions,
+        parse_generated_questions,
     };
     use crate::types::GenerationConfig;
 
@@ -399,9 +426,7 @@ mod tests {
         let (endpoint, server) = mock_server(response)?;
         let client = OllamaClient::new(endpoint);
 
-        let items = client
-            .generate_questions("prompt", &GenerationConfig::default())
-            .await?;
+        let items = generate_questions(&client, "prompt", &GenerationConfig::default()).await?;
         let request = server
             .join()
             .map_err(|_| std::io::Error::other("mock server panicked"))??;
@@ -424,9 +449,7 @@ mod tests {
         let (endpoint, server) = mock_server(response)?;
         let client = OpenAiCompatibleClient::new(endpoint, Some("secret".to_owned()));
 
-        let items = client
-            .generate_questions("prompt", &GenerationConfig::default())
-            .await?;
+        let items = generate_questions(&client, "prompt", &GenerationConfig::default()).await?;
         let request = server
             .join()
             .map_err(|_| std::io::Error::other("mock server panicked"))??;

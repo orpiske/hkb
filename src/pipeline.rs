@@ -17,9 +17,9 @@ use crate::{
     discover::{DiscoveryError, discover_markdown_excluding},
     export::{ExportError, write_alpaca_jsonl, write_manifest},
     identity::sha256_hex,
-    llm::{GeneratedQa, LlmClient, LlmError},
+    llm::{GeneratedQa, LlmClient, LlmError, generate_questions},
     progress::{GenerationSource, NoopProgress, ProgressEvent, ProgressReporter},
-    prompt::{PromptError, QaPromptTemplate, build_qa_prompt, load_qa_prompt},
+    prompt::{PromptError, PromptTemplate, build_qa_prompt, load_qa_prompt},
     qa::{normalize_question, validate_and_deduplicate},
     types::{
         BuildConfig, BuildManifest, BuildStats, Chunk, InputScope, PromptMetadata, QaItem,
@@ -244,7 +244,7 @@ struct ChunkGenerationContext<'a> {
     total: usize,
     client: &'a dyn LlmClient,
     config: &'a BuildConfig,
-    prompt_template: &'a QaPromptTemplate,
+    prompt_template: &'a PromptTemplate,
     cache: &'a GenerationCache,
     progress: &'a dyn ProgressReporter,
 }
@@ -393,9 +393,7 @@ async fn generate_batch(
         chunk,
         config.generation.questions_per_chunk,
     );
-    let items = client
-        .generate_questions(&prompt, &config.generation)
-        .await?;
+    let items = generate_questions(client, &prompt, &config.generation).await?;
 
     Ok(GenerationBatch {
         generated_at: Timestamp::now().to_string(),
@@ -495,7 +493,7 @@ mod tests {
     use super::{build_dataset, build_dataset_with_progress};
     use crate::{
         export::AlpacaRecord,
-        llm::{GeneratedQa, LlmClient, LlmError},
+        llm::{LlmClient, LlmError, LlmRequestConfig},
         progress::{GenerationSource, ProgressEvent, ProgressReporter},
         types::{BuildConfig, CacheConfig, ExportConfig, GenerationConfig},
     };
@@ -507,18 +505,22 @@ mod tests {
 
     #[async_trait]
     impl LlmClient for FakeClient {
-        async fn generate_questions(
+        async fn complete_structured(
             &self,
             _prompt: &str,
-            _config: &GenerationConfig,
-        ) -> Result<Vec<GeneratedQa>, LlmError> {
+            _config: &LlmRequestConfig<'_>,
+            _response_schema: &serde_json::Value,
+        ) -> Result<String, LlmError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Ok(vec![GeneratedQa {
-                question: "What does HKB build?".to_owned(),
-                answer: "It builds knowledge datasets.".to_owned(),
-                tags: vec!["overview".to_owned()],
-                confidence: Some(0.9),
-            }])
+            Ok(serde_json::json!({
+                "items": [{
+                    "question": "What does HKB build?",
+                    "answer": "It builds knowledge datasets.",
+                    "tags": ["overview"],
+                    "confidence": 0.9
+                }]
+            })
+            .to_string())
         }
     }
 
@@ -529,21 +531,20 @@ mod tests {
 
     #[async_trait]
     impl LlmClient for PromptCapturingClient {
-        async fn generate_questions(
+        async fn complete_structured(
             &self,
             prompt: &str,
-            _config: &GenerationConfig,
-        ) -> Result<Vec<GeneratedQa>, LlmError> {
+            _config: &LlmRequestConfig<'_>,
+            _response_schema: &serde_json::Value,
+        ) -> Result<String, LlmError> {
             match self.prompts.lock() {
                 Ok(mut prompts) => prompts.push(prompt.to_owned()),
                 Err(poisoned) => poisoned.into_inner().push(prompt.to_owned()),
             }
-            Ok(vec![GeneratedQa {
-                question: "What is documented?".to_owned(),
-                answer: "Project knowledge.".to_owned(),
-                tags: Vec::new(),
-                confidence: None,
-            }])
+            Ok(serde_json::json!({
+                "items": [{"question": "What is documented?", "answer": "Project knowledge."}]
+            })
+            .to_string())
         }
     }
 
@@ -715,11 +716,12 @@ mod tests {
 
     #[async_trait]
     impl LlmClient for ParallelClient {
-        async fn generate_questions(
+        async fn complete_structured(
             &self,
             prompt: &str,
-            _config: &GenerationConfig,
-        ) -> Result<Vec<GeneratedQa>, LlmError> {
+            _config: &LlmRequestConfig<'_>,
+            _response_schema: &serde_json::Value,
+        ) -> Result<String, LlmError> {
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak_active.fetch_max(active, Ordering::SeqCst);
 
@@ -733,12 +735,13 @@ mod tests {
             sleep(Duration::from_millis(delay_ms)).await;
             self.active.fetch_sub(1, Ordering::SeqCst);
 
-            Ok(vec![GeneratedQa {
-                question: format!("What is in the {section} section?"),
-                answer: format!("The {section} section content."),
-                tags: Vec::new(),
-                confidence: None,
-            }])
+            Ok(serde_json::json!({
+                "items": [{
+                    "question": format!("What is in the {section} section?"),
+                    "answer": format!("The {section} section content.")
+                }]
+            })
+            .to_string())
         }
     }
 
@@ -798,11 +801,12 @@ mod tests {
 
     #[async_trait]
     impl LlmClient for FlakyClient {
-        async fn generate_questions(
+        async fn complete_structured(
             &self,
             _prompt: &str,
-            _config: &GenerationConfig,
-        ) -> Result<Vec<GeneratedQa>, LlmError> {
+            _config: &LlmRequestConfig<'_>,
+            _response_schema: &serde_json::Value,
+        ) -> Result<String, LlmError> {
             if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 return Err(LlmError::UnexpectedSchema {
                     reason: "temporary malformed response".to_owned(),
@@ -810,12 +814,10 @@ mod tests {
                 });
             }
 
-            Ok(vec![GeneratedQa {
-                question: "What was retried?".to_owned(),
-                answer: "The LLM request.".to_owned(),
-                tags: Vec::new(),
-                confidence: None,
-            }])
+            Ok(serde_json::json!({
+                "items": [{"question": "What was retried?", "answer": "The LLM request."}]
+            })
+            .to_string())
         }
     }
 
@@ -859,19 +861,18 @@ mod tests {
 
     #[async_trait]
     impl LlmClient for PartiallyFailingClient {
-        async fn generate_questions(
+        async fn complete_structured(
             &self,
             prompt: &str,
-            _config: &GenerationConfig,
-        ) -> Result<Vec<GeneratedQa>, LlmError> {
+            _config: &LlmRequestConfig<'_>,
+            _response_schema: &serde_json::Value,
+        ) -> Result<String, LlmError> {
             if prompt.contains("# Successful") {
                 sleep(Duration::from_millis(10)).await;
-                return Ok(vec![GeneratedQa {
-                    question: "Which chunk succeeded?".to_owned(),
-                    answer: "The first chunk.".to_owned(),
-                    tags: Vec::new(),
-                    confidence: None,
-                }]);
+                return Ok(serde_json::json!({
+                    "items": [{"question": "Which chunk succeeded?", "answer": "The first chunk."}]
+                })
+                .to_string());
             }
 
             sleep(Duration::from_millis(50)).await;

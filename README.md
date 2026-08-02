@@ -176,6 +176,40 @@ Git commit when available, and processing statistics.
 Cached generations are stored under `.hkb` by default. A cache entry is invalidated when the chunk,
 provider, endpoint, model, prompt contents, temperature, or requested question count changes.
 
+## Verify A Dataset
+
+Use `verify` to evaluate every generated Q&A pair against its original source chunk:
+
+```bash
+cargo run -- verify \
+  --dataset /path/to/dataset.jsonl \
+  --manifest /path/to/manifest.json \
+  --repo /path/to/repository \
+  --model llama3.2 \
+  --out verification.jsonl \
+  --concurrency 2
+```
+
+The verifier independently checks that the answer is grounded in the source, the question is
+self-contained, and the answer directly addresses the question. Each report record has one of
+three verdicts:
+
+- `accepted`: all checks passed.
+- `rejected`: at least one quality check failed.
+- `unverifiable`: the original chunk could not be reconstructed, usually because the repository
+  changed after the dataset was built.
+
+Verification never modifies the input dataset. It writes `verification.jsonl` and a neighboring
+`verification-manifest.json`. Decisions are cached under `.hkb/verify` and are invalidated when the
+question, answer, source chunk, verifier model, or verification prompt changes.
+
+The default verification prompt lives in `prompts/verify-v1.md`. A project-specific prompt can be
+selected with `--prompt-file`; it must contain `{{question}}`, `{{answer}}`, and `{{chunk_text}}`.
+
+By default, quality findings do not make the command fail. For CI, use `--fail-on rejected` to fail
+when a pair is rejected, or `--fail-on any` to fail for either rejected or unverifiable records. The
+reports are written before the nonzero exit code is returned.
+
 ## Quality Checks
 
 ```bash

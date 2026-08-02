@@ -18,6 +18,11 @@ use hkb::{
         BuildConfig, CacheConfig, ChunkConfig, DiscoveryConfig, ExportConfig, GenerationConfig,
         InputScope, LlmProvider,
     },
+    verification::{
+        VerificationConfig, VerificationError, VerificationOutcome, VerificationProgressEvent,
+        VerificationProgressReporter, VerificationSource, VerificationVerdict, VerifierConfig,
+        verify_dataset_with_progress,
+    },
 };
 use indicatif::{ProgressBar, ProgressStyle};
 use thiserror::Error;
@@ -33,6 +38,8 @@ struct Cli {
 enum Command {
     /// Build a Q&A dataset from repository documentation.
     Build(BuildArgs),
+    /// Evaluate a generated dataset against its original source chunks.
+    Verify(VerifyArgs),
 }
 
 #[derive(Debug, Args)]
@@ -114,11 +121,86 @@ struct BuildArgs {
     no_gitignore: bool,
 }
 
+#[derive(Debug, Args)]
+struct VerifyArgs {
+    /// Alpaca JSONL dataset to verify.
+    #[arg(long, default_value = "dataset.jsonl")]
+    dataset: PathBuf,
+
+    /// Build manifest associated with the dataset.
+    #[arg(long, default_value = "manifest.json")]
+    manifest: PathBuf,
+
+    /// Repository used to reconstruct the original source chunks.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+
+    /// Verification JSONL output path.
+    #[arg(long, default_value = "verification.jsonl")]
+    out: PathBuf,
+
+    /// LLM API family used as the verifier.
+    #[arg(long, value_enum, default_value_t)]
+    provider: ProviderArg,
+
+    /// Verifier model. Defaults to llama3.2 for Ollama; required otherwise.
+    #[arg(long)]
+    model: Option<String>,
+
+    /// Override the verifier API endpoint.
+    #[arg(long)]
+    endpoint: Option<String>,
+
+    /// Environment variable containing the verifier API key.
+    #[arg(long, default_value = "OPENAI_API_KEY")]
+    api_key_env: String,
+
+    /// Read the verifier API key from a file instead of the environment.
+    #[arg(long)]
+    api_key_file: Option<PathBuf>,
+
+    /// Use a custom verification prompt, relative to the repository unless absolute.
+    #[arg(long, value_name = "PATH")]
+    prompt_file: Option<PathBuf>,
+
+    /// Verifier sampling temperature.
+    #[arg(long, default_value_t = 0.0)]
+    temperature: f32,
+
+    /// Maximum number of simultaneous verification requests.
+    #[arg(long, default_value_t = 1)]
+    concurrency: usize,
+
+    /// Number of retries for transient or malformed verifier responses.
+    #[arg(long, default_value_t = 2)]
+    max_retries: usize,
+
+    /// Cache directory, relative to the repository unless absolute.
+    #[arg(long, default_value = ".hkb")]
+    cache_dir: PathBuf,
+
+    /// Disable cached verification decisions.
+    #[arg(long)]
+    no_cache: bool,
+
+    /// Quality findings that should produce a nonzero exit code after writing reports.
+    #[arg(long, value_enum, default_value_t)]
+    fail_on: FailOnArg,
+}
+
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
 enum ProviderArg {
     #[default]
     Ollama,
     OpenaiCompatible,
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum FailOnArg {
+    #[default]
+    Never,
+    Rejected,
+    Any,
 }
 
 impl From<ProviderArg> for LlmProvider {
@@ -150,14 +232,36 @@ enum CliError {
     },
     #[error(transparent)]
     Build(#[from] BuildError),
+    #[error(transparent)]
+    Verification(#[from] VerificationError),
+}
+
+enum CommandOutcome {
+    Build(Box<BuildOutcome>),
+    Verify {
+        outcome: Box<VerificationOutcome>,
+        quality_gate_failed: bool,
+    },
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     match run(Cli::parse()).await {
-        Ok(outcome) => {
-            print_summary(&outcome);
+        Ok(CommandOutcome::Build(outcome)) => {
+            print_build_summary(&outcome);
             ExitCode::SUCCESS
+        }
+        Ok(CommandOutcome::Verify {
+            outcome,
+            quality_gate_failed,
+        }) => {
+            print_verification_summary(&outcome);
+            if quality_gate_failed {
+                eprintln!("error: verification findings exceeded the configured --fail-on policy");
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Err(error) => {
             eprintln!("error: {error}");
@@ -166,29 +270,16 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: Cli) -> Result<BuildOutcome, CliError> {
+async fn run(cli: Cli) -> Result<CommandOutcome, CliError> {
     match cli.command {
         Command::Build(args) => {
-            let provider = LlmProvider::from(args.provider);
-            let (model, endpoint, client): (String, String, Box<dyn LlmClient>) = match provider {
-                LlmProvider::Ollama => {
-                    let model = args.model.unwrap_or_else(|| "llama3.2".to_owned());
-                    let endpoint = args
-                        .endpoint
-                        .unwrap_or_else(|| DEFAULT_OLLAMA_ENDPOINT.to_owned());
-                    let client = Box::new(OllamaClient::new(&endpoint));
-                    (model, endpoint, client)
-                }
-                LlmProvider::OpenAiCompatible => {
-                    let api_key = resolve_api_key(args.api_key_file.as_deref(), &args.api_key_env)?;
-                    let model = args.model.ok_or(CliError::ModelRequired)?;
-                    let endpoint = args
-                        .endpoint
-                        .unwrap_or_else(|| DEFAULT_OPENAI_ENDPOINT.to_owned());
-                    let client = Box::new(OpenAiCompatibleClient::new(&endpoint, api_key));
-                    (model, endpoint, client)
-                }
-            };
+            let (provider, model, endpoint, client) = resolve_llm(
+                args.provider,
+                args.model,
+                args.endpoint,
+                args.api_key_file.as_deref(),
+                &args.api_key_env,
+            )?;
             let config = BuildConfig {
                 repository: args.repo,
                 include: InputScope::Docs,
@@ -222,7 +313,77 @@ async fn run(cli: Cli) -> Result<BuildOutcome, CliError> {
             };
             let progress = ConsoleProgress::new();
 
-            Ok(build_dataset_with_progress(client.as_ref(), &config, &progress).await?)
+            Ok(CommandOutcome::Build(Box::new(
+                build_dataset_with_progress(client.as_ref(), &config, &progress).await?,
+            )))
+        }
+        Command::Verify(args) => {
+            let (provider, model, endpoint, client) = resolve_llm(
+                args.provider,
+                args.model,
+                args.endpoint,
+                args.api_key_file.as_deref(),
+                &args.api_key_env,
+            )?;
+            let config = VerificationConfig {
+                dataset: args.dataset,
+                build_manifest: args.manifest,
+                repository: args.repo,
+                output: args.out,
+                prompt_file: args.prompt_file,
+                verifier: VerifierConfig {
+                    provider,
+                    model,
+                    endpoint: Some(endpoint),
+                    temperature: args.temperature,
+                    concurrency: args.concurrency,
+                    max_retries: args.max_retries,
+                },
+                cache: CacheConfig {
+                    enabled: !args.no_cache,
+                    directory: args.cache_dir,
+                },
+            };
+            let progress = ConsoleProgress::new();
+            let outcome = verify_dataset_with_progress(client.as_ref(), &config, &progress).await?;
+            let quality_gate_failed = match args.fail_on {
+                FailOnArg::Never => false,
+                FailOnArg::Rejected => outcome.manifest.stats.rejected_items > 0,
+                FailOnArg::Any => {
+                    outcome.manifest.stats.rejected_items
+                        + outcome.manifest.stats.unverifiable_items
+                        > 0
+                }
+            };
+            Ok(CommandOutcome::Verify {
+                outcome: Box::new(outcome),
+                quality_gate_failed,
+            })
+        }
+    }
+}
+
+fn resolve_llm(
+    provider: ProviderArg,
+    model: Option<String>,
+    endpoint: Option<String>,
+    api_key_file: Option<&Path>,
+    api_key_environment: &str,
+) -> Result<(LlmProvider, String, String, Box<dyn LlmClient>), CliError> {
+    let provider = LlmProvider::from(provider);
+    match provider {
+        LlmProvider::Ollama => {
+            let model = model.unwrap_or_else(|| "llama3.2".to_owned());
+            let endpoint = endpoint.unwrap_or_else(|| DEFAULT_OLLAMA_ENDPOINT.to_owned());
+            let client = Box::new(OllamaClient::new(&endpoint));
+            Ok((provider, model, endpoint, client))
+        }
+        LlmProvider::OpenAiCompatible => {
+            let api_key = resolve_api_key(api_key_file, api_key_environment)?;
+            let model = model.ok_or(CliError::ModelRequired)?;
+            let endpoint = endpoint.unwrap_or_else(|| DEFAULT_OPENAI_ENDPOINT.to_owned());
+            let client = Box::new(OpenAiCompatibleClient::new(&endpoint, api_key));
+            Ok((provider, model, endpoint, client))
         }
     }
 }
@@ -253,7 +414,7 @@ fn resolve_api_key(
     }
 }
 
-fn print_summary(outcome: &BuildOutcome) {
+fn print_build_summary(outcome: &BuildOutcome) {
     let stats = &outcome.manifest.stats;
     println!("Dataset: {}", outcome.dataset_path.display());
     println!("Manifest: {}", outcome.manifest_path.display());
@@ -267,6 +428,16 @@ fn print_summary(outcome: &BuildOutcome) {
             stats.skipped_files, stats.rejected_items, stats.duplicate_items
         );
     }
+}
+
+fn print_verification_summary(outcome: &VerificationOutcome) {
+    let stats = &outcome.manifest.stats;
+    println!("Verification report: {}", outcome.report_path.display());
+    println!("Verification manifest: {}", outcome.manifest_path.display());
+    println!(
+        "Verified {} items: {} accepted, {} rejected, {} unverifiable",
+        stats.total_items, stats.accepted_items, stats.rejected_items, stats.unverifiable_items
+    );
 }
 
 #[derive(Debug)]
@@ -397,6 +568,90 @@ impl ProgressReporter for ConsoleProgress {
     }
 }
 
+impl VerificationProgressReporter for ConsoleProgress {
+    fn report(&self, event: VerificationProgressEvent) {
+        match event {
+            VerificationProgressEvent::Started { total_items } => {
+                self.active_llm.store(0, Ordering::SeqCst);
+                self.bar.disable_steady_tick();
+                self.bar.set_length(total_items as u64);
+                self.bar.set_position(0);
+                self.bar.set_style(generation_style());
+                self.bar.set_prefix("ready");
+                self.bar.enable_steady_tick(Duration::from_millis(100));
+                self.bar
+                    .set_message(format!("{total_items} Q&A items queued"));
+            }
+            VerificationProgressEvent::ItemStarted {
+                index,
+                total,
+                qa_id,
+                source,
+            } => {
+                self.bar.set_length(total as u64);
+                match source {
+                    VerificationSource::Cache => self.bar.set_prefix("cache"),
+                    VerificationSource::SourceUnavailable => self.bar.set_prefix("source"),
+                    VerificationSource::Llm => {
+                        let active = self.active_llm.fetch_add(1, Ordering::SeqCst) + 1;
+                        self.bar.set_prefix(format!("LLM {active} active"));
+                    }
+                }
+                self.bar
+                    .set_message(format!("Q&A {qa_id} ({index}/{total})"));
+            }
+            VerificationProgressEvent::RetryScheduled {
+                index,
+                qa_id,
+                attempt,
+                max_retries,
+                delay_ms,
+            } => {
+                self.log(format!(
+                    "Retry {attempt}/{max_retries} for Q&A {qa_id} (item {index}) in {delay_ms} ms"
+                ));
+            }
+            VerificationProgressEvent::ItemFinished {
+                index,
+                qa_id,
+                source,
+                verdict,
+            } => {
+                if source == VerificationSource::Llm {
+                    self.active_llm.fetch_sub(1, Ordering::SeqCst);
+                }
+                self.bar.inc(1);
+                let active = self.active_llm.load(Ordering::SeqCst);
+                self.bar.set_prefix(format!("LLM {active} active"));
+                self.bar.set_message(format!(
+                    "Q&A {qa_id} (item {index}) -> {}",
+                    verdict_label(verdict)
+                ));
+            }
+            VerificationProgressEvent::WritingOutput {
+                report_path,
+                manifest_path,
+            } => {
+                self.bar.set_prefix("write");
+                self.bar.set_message(format!(
+                    "{} and {}",
+                    report_path.display(),
+                    manifest_path.display()
+                ));
+            }
+            VerificationProgressEvent::Finished => self.bar.finish_and_clear(),
+        }
+    }
+}
+
+fn verdict_label(verdict: VerificationVerdict) -> &'static str {
+    match verdict {
+        VerificationVerdict::Accepted => "accepted",
+        VerificationVerdict::Rejected => "rejected",
+        VerificationVerdict::Unverifiable => "unverifiable",
+    }
+}
+
 fn spinner_style() -> ProgressStyle {
     ProgressStyle::with_template("{spinner:.cyan} [{elapsed_precise}] {wide_msg}")
         .unwrap_or_else(|_| ProgressStyle::default_spinner())
@@ -417,12 +672,14 @@ fn generation_style() -> ProgressStyle {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, ProviderArg, resolve_api_key};
+    use super::{Cli, Command, FailOnArg, ProviderArg, resolve_api_key};
 
     #[test]
     fn parses_build_defaults() -> Result<(), clap::Error> {
         let cli = Cli::try_parse_from(["hkb", "build"])?;
-        let Command::Build(args) = cli.command;
+        let Command::Build(args) = cli.command else {
+            panic!("expected build command");
+        };
 
         assert!(matches!(args.provider, ProviderArg::Ollama));
         assert_eq!(args.repo, std::path::PathBuf::from("."));
@@ -447,7 +704,9 @@ mod tests {
             "--model",
             "local-model",
         ])?;
-        let Command::Build(args) = cli.command;
+        let Command::Build(args) = cli.command else {
+            panic!("expected build command");
+        };
 
         assert!(matches!(args.provider, ProviderArg::OpenaiCompatible));
         assert_eq!(args.model.as_deref(), Some("local-model"));
@@ -464,7 +723,9 @@ mod tests {
             "--ignore-file",
             "second.ignore",
         ])?;
-        let Command::Build(args) = cli.command;
+        let Command::Build(args) = cli.command else {
+            panic!("expected build command");
+        };
 
         assert_eq!(
             args.ignore_files,
@@ -479,12 +740,32 @@ mod tests {
     #[test]
     fn parses_a_project_prompt_file() -> Result<(), clap::Error> {
         let cli = Cli::try_parse_from(["hkb", "build", "--prompt-file", "hkb-prompt.md"])?;
-        let Command::Build(args) = cli.command;
+        let Command::Build(args) = cli.command else {
+            panic!("expected build command");
+        };
 
         assert_eq!(
             args.prompt_file,
             Some(std::path::PathBuf::from("hkb-prompt.md"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_verify_defaults() -> Result<(), clap::Error> {
+        let cli = Cli::try_parse_from(["hkb", "verify"])?;
+        let Command::Verify(args) = cli.command else {
+            panic!("expected verify command");
+        };
+
+        assert_eq!(args.dataset, std::path::PathBuf::from("dataset.jsonl"));
+        assert_eq!(args.manifest, std::path::PathBuf::from("manifest.json"));
+        assert_eq!(args.repo, std::path::PathBuf::from("."));
+        assert_eq!(args.out, std::path::PathBuf::from("verification.jsonl"));
+        assert!(matches!(args.provider, ProviderArg::Ollama));
+        assert_eq!(args.temperature, 0.0);
+        assert_eq!(args.concurrency, 1);
+        assert!(matches!(args.fail_on, FailOnArg::Never));
         Ok(())
     }
 

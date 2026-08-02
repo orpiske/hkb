@@ -45,6 +45,22 @@ impl From<&QaItem> for AlpacaRecord {
     }
 }
 
+impl From<AlpacaRecord> for QaItem {
+    fn from(record: AlpacaRecord) -> Self {
+        Self {
+            id: record.metadata.id,
+            question: record.instruction,
+            answer: record.output,
+            source: record.metadata.source,
+            chunk_id: record.metadata.chunk_id,
+            model: record.metadata.model,
+            generated_at: record.metadata.generated_at,
+            tags: record.metadata.tags,
+            confidence: record.metadata.confidence,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ExportError {
     #[error("failed to write export data")]

@@ -9,3 +9,4 @@ pub mod progress;
 pub mod prompt;
 pub mod qa;
 pub mod types;
+pub mod verification;
